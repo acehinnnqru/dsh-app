@@ -408,6 +408,30 @@ update()    1. 下载到 runtimes/.staging/<ver>/
 
 注意 mac 上 cask 的 Node 依赖问题（§6.1 表格里的 formula 行）与这里无关：bundled 变体的运行时自带/共享 Node。
 
+### D10 — 更新模型定案：B 为主 + A 兜底（运行时独立更新，壳走 cask）
+
+用户确认的取舍。**两个部件各有各的更新通道：**
+
+| 部件 | 变更频率 | 更新路径 | 是否需要重新公证 |
+|---|---|---|---|
+| **运行时**（dsh 闭包 + Node） | 跟随 dsh 发版，高 | **B**：`$DSH_HOME/dsh-app/runtimes/` 内的原子替换 + 强制冒烟（D8.2/M5） | 否 |
+| **壳**（Tauri app bundle） | 只在壳自身代码改动时 | **A**：`brew upgrade --cask` 换成新的签名 dmg（M9） | 是 |
+
+**为什么 B 为主**：壳极薄（一个状态页 + 进程管理），其变更频率远低于 dsh；把两者绑成"一次 dsh 发版 = 一次 Apple 签名公证 + 用户下整个 dmg"（上游 Electron 的选择）会让发行流程被后端版本绑架。
+
+**为什么留 A 兜底**：壳要改时本来就要重新公证，走 cask 是自然路径；而且它是唯一能替换壳的机制。
+
+**明确放弃的东西**（必须写下来，不能含糊）：
+
+1. **运行时不在签名 bundle 内**。它在用户 home、由用户自己的 app 下载、无 quarantine 标记，因此当前不触发 Gatekeeper——但这确实**绕开了 macOS 的代码校验模型**。
+2. **不能上 Mac App Store**。沙箱禁止这种"bundle 外运行下载代码"的形态；若将来要上架，只能退回纯 A。
+3. **`prev/` 只能回滚运行时，回滚不了壳**。壳更新出问题时用户得 `brew install` 指定旧版的 cask。
+4. **失去了 bundle 级的 OS 验证机制**，校验只能自己做（sha256 + 冒烟），所以那两步是**强制**的，不是可选优化。
+
+**两条对既有决定的修正：**
+
+- **cask 的 `version` 改为壳的版本**，不再是"预装运行时的版本"。理由：运行时可以独立更新，把它写进 cask 版本会让 `brew` 的心智模型和 app 内状态立刻不一致（装的是 0.1.5，app 里已经自更新到 0.1.6）。预装运行时版本改为记录在 `Resources` 里的一个字段，供"种子是什么"的诊断使用。→ 修正 §6.1。
+- **M6 的 CI 产物形态**：master 通道发的是**运行时归档**（配合 B），不是整个 dmg；整个 dmg 只在壳变更时由 `app-release` 产出。
 ---
 
 ## 4. 目录结构
@@ -561,16 +585,18 @@ cask 模板由 `scripts/package-macos.mjs` 生成（含 arm64/x64 两个 URL 与
 
 ```ruby
 cask "dsh-app" do
-  version "0.1.5-rc.1"           # 与预装运行时同源；不是壳自己的版本
+  version "0.1.0"                # 壳的版本（见 D10：运行时独立更新，不写进 cask 版本）
   sha256 arm:   "<sha256>", intel: "<sha256>"
   url "https://github.com/acehinnnqru/dsh-app/releases/download/v#{version}/dsh-app-#{version}-#{arch}.dmg"
   name "DeepSeek Harness"
   app "dsh-app.app"
-  zap trash: ["~/.dsh/dsh-app"]
+  zap trash: ["~/Library/Application Support/dsh-app"]
 end
 ```
 
-**版本号语义要小心**：cask 的 `version` 表示**预装运行时**的版本（用户看到的就是它），壳自己的版本另记在 `Info.plist` 并在"关于"里显示。master cask 用 `0.1.6-dev.<sha>.<date>`，且必须 `livecheck` 关闭/自定义，否则 brew 会拿它去和 npm 的 release 版本比较。
+**版本号语义（D10 修正）**：cask 的 `version` 是**壳的版本**。曾经打算让它表示"预装运行时的版本"，但运行时既然能独立更新，那个语义会在用户第一次自更新后立刻失效。预装运行时的版本改为记录在 `Resources` 里供诊断，app 的"关于"分别显示壳版本与当前运行时版本。
+
+master cask 的 `version` 仍用 `0.1.6-dev.<sha>.<date>` 这类形态（它预装的是 master 运行时种子），但必须自定义 `livecheck`，否则 brew 会拿它去和 npm 的 release 版本比较。
 
 **诚实提示**：slim 变体在 **cask 里无法表达 Node 依赖**（cask 的 `depends_on formula:` 不能保证 GUI app 的 PATH）。因此 slim 走 formula，且 formula 里需要写一个 wrapper 把 `node` 的绝对路径固定下来，或让 app 的 doctor 自己去 brew 前缀找 `node`（我们的三级探测已经会看 `/opt/homebrew/bin`，两条都留着）。
 
