@@ -1,0 +1,21 @@
+# Node
+node_modules/
+.pnpm-store/
+
+# 运行时闭包与构建产物（可重建，不入库）
+.dsh-build/
+dist/
+*.tgz
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Nix
+result
+result-*
+.direnv/
+
+# macOS
+.DS_Store

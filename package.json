@@ -1,0 +1,29 @@
+{
+  "name": "dsh-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A Tauri desktop shell for DeepSeek Harness (dsh).",
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "dshRuntime": {
+    "version": "0.1.5-rc.1",
+    "package": "@deepseek-ai/dsh",
+    "nodeVersion": "24.17.0"
+  },
+  "scripts": {
+    "runtime:prepare": "node scripts/prepare-runtime.mjs",
+    "runtime:prepare-node": "node scripts/prepare-node.mjs",
+    "runtime:probe": "node scripts/probe-runtime.mjs",
+    "runtime:run": "node scripts/run-runtime.mjs",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build --bundles app"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
