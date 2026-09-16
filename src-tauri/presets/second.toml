@@ -1,0 +1,17 @@
+# A second preset, kept here as a reviewable sample: the shell reads presets from
+# <home>/dsh-app/presets/, so copy this file (and its patch.d/) there to use it.
+#
+# It exists to exercise concurrency: two presets own two profiles, so both may
+# run at once and open their own window.
+id = "second"
+label = "Second"
+kind = "web"
+profile = "dsh-app-second"
+patch_reload = "startup"
+bundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
+
+# A fixed port proves the patch layer is what decides it, and keeps the two
+# running GUIs from competing for the same OS-assigned port.
+patches = ["patch.d/fixed-port.yml"]
+
+[env]

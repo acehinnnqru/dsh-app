@@ -1,0 +1,6 @@
+# `config` REPLACES the target row's whole config object (it is not a deep
+# merge), so every required field of @deepseek-ai/dsh-host-webserver must appear.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 45677
