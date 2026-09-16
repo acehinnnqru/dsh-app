@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The shell page ships inside the binary; it must never be reused from a
+         webview cache after an update. -->
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <title>DeepSeek Harness</title>
+    <link rel="stylesheet" href="shell.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>DeepSeek Harness</h1>
+        <button id="reload" type="button" class="ghost" title="Re-read preset files">Reload presets</button>
+      </header>
+
+      <section id="fatal" class="problems" hidden></section>
+      <section id="problems" class="problems" hidden></section>
+
+      <ul id="presets" class="presets"></ul>
+
+      <p id="empty" class="empty" hidden>
+        No presets found. Add a preset file under <code>dsh-app/presets/</code> and press
+        <em>Reload presets</em>.
+      </p>
+
+      <details class="facts-wrap">
+        <summary>Runtime</summary>
+        <dl class="facts">
+          <dt>Runtime</dt>
+          <dd id="fact-runtime" class="mono">—</dd>
+          <dt>Node</dt>
+          <dd id="fact-node" class="mono">—</dd>
+          <dt>Home</dt>
+          <dd id="fact-home" class="mono">—</dd>
+          <dt>Shell</dt>
+          <dd id="fact-ui" class="mono">—</dd>
+        </dl>
+      </details>
+    </main>
+    <script type="module" src="shell.js"></script>
+  </body>
+</html>
