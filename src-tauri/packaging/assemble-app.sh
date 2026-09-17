@@ -23,6 +23,10 @@ binary=""
 out=""
 seed=""
 version="0.0.0"
+# The bundle identifier is a signing input — it becomes part of the designated
+# requirement — so it is declared rather than defaulted silently, and
+# `DSH_APP_APP_ID` is how the packaging environment states it.
+bundle_id="${DSH_APP_APP_ID:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,9 +34,16 @@ while [ $# -gt 0 ]; do
     --out) out="$2"; shift 2 ;;
     --seed) seed="$2"; shift 2 ;;
     --version) version="$2"; shift 2 ;;
+    --bundle-id) bundle_id="$2"; shift 2 ;;
     *) echo "assemble-app: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+
+[ -n "$bundle_id" ] || {
+  echo "assemble-app: the bundle identifier is required (--bundle-id or DSH_APP_APP_ID)" >&2
+  echo "assemble-app: signing a bundle whose id nobody chose fails much later, and confusingly" >&2
+  exit 2
+}
 
 [ -n "$binary" ] || { echo "assemble-app: --binary is required" >&2; exit 2; }
 [ -n "$out" ] || { echo "assemble-app: --out is required" >&2; exit 2; }
@@ -82,7 +93,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>dsh-app</string>
   <key>CFBundleDisplayName</key><string>DeepSeek Harness</string>
   <key>CFBundleExecutable</key><string>dsh-app</string>
-  <key>CFBundleIdentifier</key><string>com.acehinnnqru.dsh-app</string>
+  <key>CFBundleIdentifier</key><string>$bundle_id</string>
   <key>CFBundleIconFile</key><string>icon.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

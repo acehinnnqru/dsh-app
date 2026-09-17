@@ -36,7 +36,12 @@ esac
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
-store="$(nix build --no-link --print-out-paths ".#dsh-app-$variant" --extra-experimental-features 'nix-command flakes' 2>/dev/null | tail -n1)"
+# The bundle id must be the one the app was built with: signing under a different
+# id changes the designated requirement. It reaches the build through the
+# environment, which is why `--impure` is required (flakes reject `--argstr`).
+: "${DSH_APP_APP_ID:?export-app.sh: DSH_APP_APP_ID is required to build an app bundle}"
+store="$(nix build --impure --no-link --print-out-paths \
+  ".#dsh-app-$variant" --extra-experimental-features 'nix-command flakes' 2>/dev/null | tail -n1)"
 [ -n "$store" ] || { echo "export-app.sh: nix build produced no path" >&2; exit 1; }
 
 source_app="$store/Applications/dsh-app.app"

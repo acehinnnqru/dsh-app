@@ -10,17 +10,21 @@
     };
   };
 
+  # `appId` is an argument rather than an environment lookup: flake evaluation is
+  # pure, and the identifier becomes part of the code signature, so it must be
+  # stated explicitly and appear in the build it produced. Build the app with
+  # `nix build --argstr appId com.example.dsh-app .#dsh-app-bundled`.
+  # Apple Silicon macOS is the only target. Declaring it here means evaluating
+  # this flake anywhere else fails with "flake does not provide" rather than
+  # producing an artifact tagged for the wrong platform — the closure resolves
+  # native packages (`node-pty`, `koffi`, the `require-builtin` addon) for the
+  # machine that builds it, so there is no correct cross-build.
   outputs = {
     nixpkgs,
     utils,
     devshells,
     ...
   }:
-    # Apple Silicon macOS is the only target. Declaring it here means evaluating
-    # this flake anywhere else fails with "flake does not provide" rather than
-    # producing an artifact tagged for the wrong platform — the closure resolves
-    # native packages (`node-pty`, `koffi`, the `require-builtin` addon) for the
-    # machine that builds it, so there is no correct cross-build.
     utils.lib.eachSystem ["aarch64-darwin"] (
       system: let
         pkgs = import nixpkgs {inherit system;};
@@ -32,6 +36,27 @@
         dshPackage = rootManifest.dshRuntime.package;
         nodeVersion = rootManifest.dshRuntime.nodeVersion;
         shellVersion = rootManifest.version;
+
+        # The bundle identifier is embedded in `Info.plist` and therefore in the
+        # signature's designated requirement, so it must be stated rather than
+        # defaulted to something nobody chose.
+        #
+        # It is read from the environment, which means app builds need `--impure`.
+        # Flakes cannot take arguments: `--arg`/`--argstr` are rejected for flake
+        # installables in Nix 2.34 ("incompatible with flakes"), and a repository
+        # file cannot serve either — tracked means not configurable, untracked
+        # means it never enters the flake source.
+        appId = builtins.getEnv "DSH_APP_APP_ID";
+        requireAppId =
+          if appId == ""
+          then throw ''
+            DSH_APP_APP_ID is unset: an app bundle needs a bundle identifier, and
+            it becomes part of the signature. It is read from the environment, so
+            build with `--impure` and export it first (`.envrc` already does):
+
+              nix build --impure .#dsh-app-bundled
+          ''
+          else appId;
 
         # Always true now that the flake declares one system; the conditionals
         # using it are kept because they mark which inputs exist *because of*
@@ -162,6 +187,32 @@
             binary="$(find . -maxdepth 3 -path '*/target/release/dsh-app' -type f | head -n1)"
             [ -n "$binary" ] || { echo "the shell binary was not built" >&2; exit 1; }
             install -m 755 "$binary" "$out/bin/dsh-app"
+
+            # Rewrite any load command that points into the Nix store to the
+            # system library it duplicates, then assert none remain.
+            #
+            # This is not cosmetic. A store path is an absolute path into *this*
+            # machine's Nix store, so a shipped bundle would fail to launch
+            # anywhere else; and once the app is signed, the hardened runtime
+            # refuses to load a dylib signed by a different team, which every
+            # Nix-store library is. Both failures appear only after signing,
+            # which is why they went unnoticed until the signature existed.
+            #
+            # macOS carries the same library in the dyld shared cache, where it
+            # counts as a platform binary and is always acceptable.
+            for current in $(otool -L "$out/bin/dsh-app" | tail -n +2 | awk '{print $1}' | grep '^/nix/store/' || true); do
+              case "$current" in
+                */libiconv.2.dylib) install_name_tool -change "$current" /usr/lib/libiconv.2.dylib "$out/bin/dsh-app" ;;
+              esac
+            done
+
+            remaining="$(otool -L "$out/bin/dsh-app" | tail -n +2 | awk '{print $1}' | grep -c '^/nix/store/' || true)"
+            if [ "$remaining" != "0" ]; then
+              echo "the shell still references $remaining Nix store libraries:" >&2
+              otool -L "$out/bin/dsh-app" | grep '/nix/store/' >&2
+              echo "the bundle would not launch elsewhere, and signing would refuse them" >&2
+              exit 1
+            fi
           '';
 
           doCheck = false;
@@ -181,6 +232,7 @@
             dontUnpack = true;
 
             nativeBuildInputs = [pkgs.rsync];
+            DSH_APP_APP_ID = requireAppId;
 
             buildPhase = ''
               work="$PWD/work"
@@ -211,6 +263,7 @@
               "$crate/packaging/assemble-app.sh" \
                 --binary "$work/bin/dsh-app" \
                 --out "$work/out" \
+                --bundle-id ${requireAppId} \
                 ${lib.optionalString (withSeed != null) ''--seed "$seed" \''}
                 --version ${shellVersion}
 

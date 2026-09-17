@@ -1291,6 +1291,75 @@ updater 需要的文档**。已改名为 `channel-<channel>.json`。
 | 导出的 app 启动 | 装种子、过冒烟，并用**自己 bundle 里的 Node**（`Contents/Resources/node/bin/node`） |
 
 
+## 19. 签名完成（不含公证，按用户决定）
+
+`src-tauri/packaging/sign-app.sh` 已用真实 Developer ID 跑通。**11 个 Mach-O + app 本身**
+全部带上 `TeamIdentifier=XQYB6GQJJ5`，`codesign --verify --deep --strict` 通过，
+签名后冷启动装种子、过冒烟。
+
+### 19.1 只有签名才会暴露的两个问题
+
+这两个都是**在签名之前完全正常**的，所以一直没被发现——这也说明"签名后冒烟"必须留在流程里。
+
+**① `libiconv` 链接到 Nix store 的绝对路径**
+
+```
+dyld: Library not loaded: /nix/store/…-libiconv-115.100.1/lib/libiconv.2.dylib
+      … (non-platform) have different Team IDs
+```
+
+壳二进制里有**一个**非系统依赖（`libiconv`），指向 store 的绝对路径。两重致命：
+
+- 那是**这台机器**的路径，换台机器直接找不到；
+- 即使找到，签名后 hardened runtime 的 library validation 会拒绝**不同 Team ID** 的动态库，而 Nix store 里的库都是上游签的。
+
+修法在 `dshApp` 的 `installPhase`：`install_name_tool` 把它改写为 `/usr/lib/libiconv.2.dylib`。
+该文件在磁盘上不存在，但 macOS 从 **dyld shared cache** 提供它，在那里它是 platform binary，
+永远可加载。改写后加了断言：**store 依赖数必须为 0**，否则构建失败。
+
+**② 打进 bundle 的 Node 丢失全部 entitlements**
+
+官方 Node 有 6 项，`install` 进 bundle 后**变成 0 项**——复制二进制会让签名失效、entitlements 随之消失。
+而 `codesign --preserve-metadata=entitlements` 是**从这份已经没有 entitlements 的副本里抽取**，
+于是静默产出空文件。后果：V8 起不来，报 `Fatal process out of memory: Failed to reserve
+virtual memory for CodeRange`（JIT 需要 `allow-jit`）。
+
+修法：entitlements **从 store 里那份原始官方 Node 显式提取**
+（`packaging/entitlements/extract-node-entitlements.sh`），并去掉 `get-task-allow`。
+脚本随后**断言**三项必须在（`allow-jit`、`allow-unsigned-executable-memory`、
+`disable-library-validation`）、`get-task-allow` 必须不在。
+
+这是同一类错误的**第三次**出现（seed 目录名、`install` 不保留权限、这次是 entitlements）：
+**Nix 的 store 里的东西是对的，经过一次复制就不再是原来那个东西。**
+
+### 19.2 签名清单与顺序
+
+12 个 Mach-O（壳、Node、10 个原生扩展），逐个签：
+
+```
+Contents/MacOS/dsh-app                                          壳
+Contents/Resources/node/bin/node                                Node（唯一需要 entitlements）
+Contents/Resources/runtimes/<ver>/node_modules/**/*.node        node-pty, koffi, require-builtin,
+                                                                node-addon-system, sharp
+Contents/Resources/runtimes/<ver>/node_modules/**/rg, *.dylib  ripgrep, libvips
+```
+
+顺序是契约：**由内向外**（深的先签，app 最后），因为签名覆盖其内容。
+全部使用 `--options runtime --timestamp`。
+
+「11 个」这个数字是脚本自己数出来的，不是我对扩展名的假设——`find … -exec file` 按实际
+Mach-O 判定，这样新增一个原生依赖不会静默漏签（漏签的后果是公证在最后一步失败）。
+
+### 19.3 已知未决
+
+- **公证按用户决定跳过**。代价是首次打开需右键 → 打开；`sign-app.sh` 末尾会明确打印这一点。
+  加公证是末尾两步（`notarytool submit` + `stapler staple`），不需要重写脚本。
+- **slim 变体仍然不可分发**：它靠 PATH 上的 Node，而 PATH 上的 Node 在各机器上不一定存在、
+  也可能是不支持 `require-builtin` 的构建。要在别处用，得让用户装 Node，或改用 bundled 变体。
+- **`libiconv` 的修法是针对这一个库的**（唯一一个非系统依赖）。若将来新增依赖引入别的
+  store 库，`installPhase` 里的断言会失败并打印清单，而不是静默产出跑不起来的包。
+
+
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
 > 版本基线：tauri 2.11.5 / tauri-runtime-wry 2.11.4（wry 0.56.0）/ tao 0.37.0 / tauri-plugin-updater 2.11.0。

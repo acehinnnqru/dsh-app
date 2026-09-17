@@ -57,8 +57,8 @@ function parseArgs(argv) {
 }
 
 /** Build one flake output and return its store path. */
-async function nixBuild(attribute) {
-  const { stdout } = await run('nix', ['build', '--no-link', '--print-out-paths', attribute], {
+async function nixBuild(attribute, extraArgs = []) {
+  const { stdout } = await run('nix', ['build', '--no-link', '--print-out-paths', ...extraArgs, attribute], {
     cwd: ROOT,
     maxBuffer: 64 * 1024 * 1024,
   })
@@ -93,7 +93,13 @@ async function main() {
   for (const variant of ['bundled', 'slim']) {
     if (!options.buildApps) continue
     console.log(`package-release: building the ${variant} app`)
-    apps[variant] = join(await nixBuild(`.#dsh-app-${variant}`), 'Applications', 'dsh-app.app')
+    // `--impure` so the flake can read DSH_APP_APP_ID from the environment;
+    // flakes reject `--argstr`. See `export-app.sh` for the full reasoning.
+    if (!process.env.DSH_APP_APP_ID) {
+      throw new Error('package-release: DSH_APP_APP_ID is required to build an app bundle')
+    }
+    const store = await nixBuild(`.#dsh-app-${variant}`, ['--impure'])
+    apps[variant] = join(store, 'Applications', 'dsh-app.app')
   }
   if (!options.buildApps) {
     console.log('package-release: skipping the apps (pass --build-apps, or build them where they are used)')
