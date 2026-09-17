@@ -27,7 +27,10 @@ import { fileURLToPath } from 'node:url'
 const run = promisify(execFile)
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const BUILD = join(ROOT, '.dsh-build')
+// `DSH_BUILD_ROOT` redirects the output tree, so a packaging build (Nix, CI) can
+// reuse this recipe instead of re-implementing the closure layout — the deploy
+// flags and the manifest shape are the parts most likely to rot if copied.
+const BUILD = process.env.DSH_BUILD_ROOT ?? join(ROOT, '.dsh-build')
 const RUNTIMES = join(BUILD, 'runtimes')
 const STAGING_ROOT = join(BUILD, 'staging')
 
@@ -212,7 +215,9 @@ async function main() {
   // workspace member (the same shape upstream's Python runtime uses).
   const project = join(staging, 'runtime')
   const projectName = 'dsh-app-runtime'
-  const deploy = join(staging, 'closure')
+  // Absolute: the path handed to pnpm and the path checked afterwards must be
+  // the same string, or a differing cwd turns a success into a false failure.
+  const deploy = resolve(staging, 'closure')
   console.log(`prepare-runtime: staging ${relative(ROOT, staging)}`)
 
   try {
@@ -230,7 +235,7 @@ async function main() {
     await exec('pnpm', ['--filter', projectName, 'add', '--save-exact', '--ignore-scripts', spec], { cwd: staging })
 
     console.log('prepare-runtime: deploying production closure (hoisted, links materialized)')
-    await exec('pnpm', [
+    const deployed = await exec('pnpm', [
       '--filter', projectName,
       'deploy',
       '--legacy',
@@ -245,6 +250,19 @@ async function main() {
       '--config.link-workspace-packages=true',
       deploy,
     ], { cwd: staging })
+    if (deployed.stdout.trim() !== '') console.log(deployed.stdout.trim())
+    if (deployed.stderr.trim() !== '') console.error(deployed.stderr.trim())
+    // `pnpm deploy` can exit 0 without producing anything when its arguments are
+    // not the ones it expects, which would otherwise surface as an unrelated
+    // ENOENT three steps later.
+    if (!existsSync(deploy)) {
+      throw new Error(
+        `pnpm deploy reported success but produced no directory at ${deploy}; ` +
+          `pnpm ${process.env.npm_config_user_agent ?? '(unknown version)'} was invoked with: ` +
+          'deploy --legacy --prod --ignore-scripts --config.node-linker=hoisted ' +
+          '--config.auto-install-peers=true --config.link-workspace-packages=true',
+      )
+    }
 
     await materializeLinks(deploy)
     await removeBinDirs(deploy)

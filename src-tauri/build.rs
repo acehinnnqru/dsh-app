@@ -27,7 +27,6 @@ fn main() {
     println!("cargo:rerun-if-changed=presets");
     println!("cargo:rustc-env=DSH_APP_UI_VERSION={}", ui_version());
     copy_seed_presets();
-    create_seed_runtime_dir();
     tauri_build::build()
 }
 
@@ -47,29 +46,6 @@ fn copy_seed_presets() {
     if let Err(error) = copy_dir(source, &target) {
         // A missing seed is not fatal; the shell writes its own default preset.
         println!("cargo:warning=could not stage sample presets: {error}");
-    }
-}
-
-/// Create the resources directory the runtime seed is placed in.
-///
-/// The closure is tens of thousands of files and hundreds of megabytes, so it is
-/// deliberately NOT copied here: `config::seed_runtime_dir` resolves the seed
-/// from the bundle's resources at runtime, and staging never has to run for a
-/// build. An empty directory keeps the resource declaration valid.
-fn create_seed_runtime_dir() {
-    // Relative to this crate, not `OUT_DIR`: a bundle resource path is resolved
-    // against the manifest directory.
-    let dir = Path::new("gen/seed-runtime");
-    let _ = std::fs::create_dir_all(dir);
-    let marker = dir.join("README.md");
-    if !marker.exists() {
-        let _ = std::fs::write(
-            &marker,
-            "# Seed runtime drop point\n\n\
-             A built closure (`.dsh-build/runtimes/<id>/`) is copied in here when\n\
-             packaging, so the app can boot offline on first run. During development\n\
-             the shell reads `.dsh-build/runtimes` directly and this stays empty.\n",
-        );
     }
 }
 

@@ -224,6 +224,19 @@ fn resolve_node(root: &Path, manifest: &RuntimeManifest) -> Result<PathBuf, Stri
         }
     }
 
+    // The Node the bundle carries, for the `bundled` variant. It sits in
+    // Resources rather than MacOS because `Contents/MacOS` is reserved for the
+    // shell executable itself (design doc A.3/A.4).
+    if let Ok(exe) = std::env::current_exe() {
+        let bundled = exe
+            .parent()
+            .map(|dir| dir.join("../Resources/node/bin/node"))
+            .unwrap_or_default();
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+
     // Fall back to PATH so a plain `cargo run` works in the devshell.
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {

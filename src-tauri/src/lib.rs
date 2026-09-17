@@ -27,10 +27,8 @@ use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 use config::AppConfig;
 use node_probe::NodeProbeCache;
-use preset::Preset;
 use preset_store::ResolvedPreset;
 use runtime_store::RuntimeStore;
-use smoke::smoke;
 use supervisor::{Phase, SupervisedChild};
 
 /// The shell's own page, compiled into the binary from `ui/`.
@@ -550,6 +548,17 @@ pub fn run() {
     // shell being able to start.
     if let Some(code) = handle_startup_flags(&store) {
         std::process::exit(code);
+    }
+
+    // Which runtime and which Node this process resolved. Recorded because a
+    // packaged app's Home is not the repository, so "which Node is it using" is
+    // the first question whenever a bundled variant misbehaves.
+    if let Ok(config) = config::load(&home, &store) {
+        eprintln!(
+            "[dsh-app] runtime {} via node {}",
+            config.runtime.dir.display(),
+            config.runtime.node.display()
+        );
     }
 
     let config = match config::load(&home, &store) {
