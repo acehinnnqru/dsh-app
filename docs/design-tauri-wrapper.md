@@ -1023,6 +1023,63 @@ Nix Node 加断言 → **FAIL 并 exit 1**；不加断言 → OK 但输出 note�
 能不能跑的判据。
 
 
+## 15. M5 完成：运行时存储、强制冒烟、回滚
+
+### 15.1 种子路径改为运行时解析（推翻 D8.2 U3 的一处实现细节）
+
+D8.2 原本设想"首次启动做一次 seed → home 的复制"，实现时发现**种子路径不能靠构建期 staging**：
+闭包 210 MB / 24k 文件，每次构建复制它会主导构建时间；而 `build.rs` 又不会在
+`pnpm runtime:prepare` 重建闭包后自动重跑（我已经为 `ui/` 和 `presets/` 加了
+`rerun-if-changed`，再加一条 210 MB 的复制只会更糟）。
+
+改为 `config::seed_runtime_dir()` **在运行时解析**，按布局依次尝试：
+
+```
+<bundle>/Contents/Resources/runtimes/<id>/    打包后（bundle.resources 声明）
+<repo>/.dsh-build/runtimes/<id>/              开发构建
+```
+
+`build.rs` 只创建空的 `src-tauri/gen/seed-runtime/` 让资源声明合法。打包时由 M7/M9 的脚本
+把闭包拷进去。**代价**：开发构建同样会执行 seed 安装（从 `.dsh-build/runtimes`），一次 210 MB
+的复制；换来的是构建时间不受影响。
+
+### 15.2 强制冒烟落在哪
+
+冒烟是 `activate()` 的**前置条件而不是它的一部分**：`activate()` 只做原子切换，调用方负责先证明
+候选能起。理由是这样 store 保持"原语"语义，而"新运行时投入服务必须先验证"这条规则由 `lib.rs`
+的 seed 路径执行——将来 M6 的下载路径复用同一个门禁。
+
+冒烟用**独立的 scratch profile**（`<home>/dsh-app/smoke/profiles/dsh-app-smoke`），绝不碰用户的
+`profiles/<preset>`：一次验证不能扰动正在使用的 profile。它固定用 `patchReload: startup`，
+因为 internals 是 profile 的属性、不是运行时的属性。
+
+实测（三条路径）：
+
+| 场景 | 结果 |
+|---|---|
+| 正常 seed | 过冒烟 → 激活 → `current -> release-0.1.5-rc.1` |
+| 坏运行时（entry 指向缺失文件） | 冒烟/启动失败 → preset 转 `failed` 并把子进程 stderr 尾部交给 UI |
+| 坏版本处于 active 时执行 `--rollback` | 切回上一个版本 → 壳正常 `ready` |
+
+### 15.3 `--rollback` 是恢复路径，不是测试后门
+
+壳起不来时用户需要一个终端可达的出口，所以回滚做成了命令行开关（`dsh-app --rollback`），
+GUI 里同时有一个按钮（两者都受"先停掉所有 preset"约束）。这不是为了方便测试才加的——
+加它是因为**只有 GUI 一条恢复路径本身就是个设计缺陷**。
+
+### 15.4 一处实现修正
+
+`installed` 列表原先把 `current` / `previous` 两个软链也算成了版本。改用 link-aware 的
+`file_type()` 判定。这类错误不会让功能失效，但会让人误判 store 里有什么。
+
+### 15.5 M5 的边界（尚未做的部分）
+
+- **`channel.rs` 的 `check()` / `update()` 未实现**：目前没有任何网络路径，运行时只能来自
+  种子。真正"追新"要等 M6（master 通道的 CI 产物）与 release 通道的下载实现。
+- 因此**"更新"这条路径本身还没有端到端验证过**，只有它的两个端点（安装、激活/回滚）验证过。
+- UI 只有"回滚"按钮，没有"检查更新"。
+
+
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
 > 版本基线：tauri 2.11.5 / tauri-runtime-wry 2.11.4（wry 0.56.0）/ tao 0.37.0 / tauri-plugin-updater 2.11.0。
