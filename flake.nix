@@ -16,7 +16,12 @@
     devshells,
     ...
   }:
-    utils.lib.eachDefaultSystem (
+    # Apple Silicon macOS is the only target. Declaring it here means evaluating
+    # this flake anywhere else fails with "flake does not provide" rather than
+    # producing an artifact tagged for the wrong platform — the closure resolves
+    # native packages (`node-pty`, `koffi`, the `require-builtin` addon) for the
+    # machine that builds it, so there is no correct cross-build.
+    utils.lib.eachSystem ["aarch64-darwin"] (
       system: let
         pkgs = import nixpkgs {inherit system;};
         inherit (nixpkgs) lib;
@@ -28,14 +33,15 @@
         nodeVersion = rootManifest.dshRuntime.nodeVersion;
         shellVersion = rootManifest.version;
 
+        # Always true now that the flake declares one system; the conditionals
+        # using it are kept because they mark which inputs exist *because of*
+        # macOS, which is what a future Linux port would have to revisit.
         isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-        isArm = pkgs.stdenv.hostPlatform.isAarch64;
-        # Node's own arch spelling: `arm64` / `x64`, not Nix's `aarch64` / `x86_64`.
-        nodeArch =
-          if isArm
-          then "arm64"
-          else "x64";
-        platformTag = "${pkgs.stdenv.hostPlatform.parsed.kernel.name}-${nodeArch}";
+        # Node's own arch spelling: `arm64`, not Nix's `aarch64`. The same tag
+        # appears in `runtime.json`, the Node archive names, and
+        # `channel::platform_tag`; a second convention would silently stop
+        # matching.
+        platformTag = "${pkgs.stdenv.hostPlatform.parsed.kernel.name}-arm64";
 
         nodejs = pkgs.nodejs_22;
         # Pinned explicitly: the closure recipe depends on pnpm's deploy

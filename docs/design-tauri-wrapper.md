@@ -1213,6 +1213,84 @@ M5 只验证了"安装"与"回滚"两个端点，中间的**更新**这一整段
 - 渠道 URL 目前只能由 store.json 手工写入；"安装时按 cask 决定渠道"要等 M9。
 
 
+## 18. 平台与发布路径收窄（用户决定）
+
+### 18.1 只支持 Apple Silicon macOS
+
+用户明确：**不做 x64，其他 macOS 也不支持**。落地为：
+
+- `flake.nix` 从 `eachDefaultSystem` 收窄到 `eachSystem ["aarch64-darwin"]`，`platformTag`
+  变成常量 `darwin-arm64`（不再有 `isArm` 分支）。在别的系统上求值会得到
+  "flake does not provide"，这是诚实的答案——闭包为构建它的机器解析原生包，**不存在正确的交叉构建**。
+- CI 矩阵收成单平台。
+
+收窄本身消掉一类隐患：`channel::platform_tag()`、下载期平台校验、打包脚本的平台校验、
+`runtime.json` 四处现在永远一致，并且 `pnpm` 解析 `node-pty`/`koffi`/`require-builtin`
+的 optional 包时只有一个正确答案。
+
+### 18.2 [改] GitHub 托管 runner 的现实（前一轮我写错了）
+
+查 `actions/runner-images` 后确认：
+
+| 镜像 | 架构 | 标签 |
+|---|---|---|
+| macOS 26 / 15（arm64） | arm64 | `macos-latest` / `macos-26` / `macos-15` |
+| macOS 26 / 15（Intel） | x64 | `macos-26-large` / `macos-15-large` — **larger runner，付费** |
+| macOS 14 | arm64 | 已 deprecated |
+
+我原先写的 `macos-14`（已 deprecated）与 `macos-13`（已退役）都是错的；更要紧的是
+**免费的标准 macOS runner 只有 arm64**，所以那份双平台矩阵根本产不出 `darwin-x64`。
+
+### 18.3 CI 降级为"可选、手动"
+
+用户决定：**不用 CI 打包**，本地来。`.github/workflows/runtime.yml` 保留但：
+去掉 `schedule`（不再有无人值守的运行）、矩阵收成单平台、runner 可通过 input 覆盖为自托管、
+文件头写明它是**可选手动路径而非发布流程**，并记录托管 runner 的三个约束（约 14 GB 磁盘、
+Nix 多用户 daemon 是脆弱环节、没有免费 Intel）。
+
+保留它的理由：那些约束是踩出来的，删掉文件就得重新踩一遍。
+
+### 18.4 发布路径重构：不要把东西从 store 里复制出来
+
+这一轮我在这上面反复失败（连续几轮都在给同一个权限问题打补丁），根因值得写下来：
+
+**Nix store 的路径是只读的（`0555`），而 `fs.cp` / `cp -R` 会连目录权限位一起复制。**
+于是"从 store 复制一个 bundle 出来"总会得到一个只读副本，后续任何写入（tar 清理、
+`codesign`）都以 `EACCES` 失败。我先后试了 `mode: 0o755`（无效——`fs.cp` 的 `mode`
+只作用于它写入的文件，不作用于目录）和递归 `chmod`（有效但仍是补丁）。
+
+**真正的修法是不要复制**：
+
+```
+dist/                                    ← 只放可移植且只读的东西
+  dsh-runtime-<ver>-<platform>.tar.gz      updater 的载荷
+  channel-<channel>.json                   channel 文档
+  release.json                             本次发布的摘要
+```
+
+`.app` 不进 `dist/`。store 路径**本来就能直接运行**（只读的东西我们只读地用），
+而"做成可写副本"只对**签名**有意义——那是 `packaging/export-app.sh` 的职责，
+在真正拿到 Developer ID 时才跑（§7.2）。放在发布脚本里会让每次本地打包都产出一个
+看起来能发布、其实未签名的可变产物。
+
+### 18.5 顺带修掉的一个静默覆盖
+
+`package-runtime.mjs` 写的 channel 文档名叫 `<channel>.json`，而 `package-release.mjs`
+的摘要在同一目录写 `release.json`——**channel 为 release 时两者同名，摘要静默覆盖了
+updater 需要的文档**。已改名为 `channel-<channel>.json`。
+
+这个 bug 的危险之处在于它是静默的：打包看起来成功，只有壳去 fetch 时才会发现文档是错的。
+
+### 18.6 实测
+
+| 步骤 | 结果 |
+|---|---|
+| `nix build .#dsh-runtime` | 收窄 flake 后仍能构建 |
+| `node scripts/package-release.mjs` | `dist/` = 运行时归档（51.7 MB）+ `channel-release.json` + `release.json` |
+| `packaging/export-app.sh bundled <dir>` | `dr-xr-xr-x` → `drwxr-xr-x`，可签名 |
+| 导出的 app 启动 | 装种子、过冒烟，并用**自己 bundle 里的 Node**（`Contents/Resources/node/bin/node`） |
+
+
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
 > 版本基线：tauri 2.11.5 / tauri-runtime-wry 2.11.4（wry 0.56.0）/ tao 0.37.0 / tauri-plugin-updater 2.11.0。

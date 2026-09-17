@@ -19,7 +19,8 @@
     "runtime:probe": "node scripts/probe-runtime.mjs",
     "runtime:run": "node scripts/run-runtime.mjs",
     "app:dev": "tauri dev",
-    "app:build": "tauri build --bundles app"
+    "app:build": "tauri build --bundles app",
+    "release:package": "node scripts/package-release.mjs"
   },
   "devDependencies": {
     "@tauri-apps/api": "^2.11.1",

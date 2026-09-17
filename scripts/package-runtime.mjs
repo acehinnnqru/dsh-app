@@ -17,7 +17,7 @@
 
 import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -71,6 +71,22 @@ async function digestOf(path) {
   return createHash('sha256').update(await readFile(path)).digest('hex')
 }
 
+/**
+ * Recursively add owner-write permission.
+ * @param {string} root - directory to widen, in place.
+ */
+async function makeWritable(root) {
+  await chmod(root, 0o755)
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (entry.isDirectory()) {
+      await makeWritable(path)
+      continue
+    }
+    if (entry.isFile()) await chmod(path, 0o644)
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   const runtime = resolve(options.runtime)
@@ -101,8 +117,13 @@ async function main() {
   try {
     const versioned = join(staging, manifest.dshVersion)
     await mkdir(versioned, { recursive: true })
-    // `/.` copies the contents; a bare directory would nest one level deeper.
-    await cp(runtime, versioned, { recursive: true })
+    await cp(runtime, versioned, { recursive: true, force: true })
+    // A source path under `/nix/store` is read-only, and `fs.cp` does not apply
+    // `mode` to directories — only to the files it writes. So the copy inherits
+    // 0o555 directories, and the very next step (staging cleanup after tar, or a
+    // rebuild over the same path) fails with EACCES. `tar` records the modes it
+    // finds, so widening them here cannot leak into the archive's content.
+    await makeWritable(versioned)
     await rm(archive, { force: true })
     await run('tar', ['czf', archive, '-C', staging, manifest.dshVersion])
   } finally {
@@ -123,7 +144,10 @@ async function main() {
       },
     ],
   }
-  const documentPath = join(out, `${options.channel}.json`)
+  // `channel-` prefix on purpose: a bare `<channel>.json` collides with the
+  // release summary `package-release.mjs` writes beside it, and the collision
+  // silently overwrote the document the updater needs.
+  const documentPath = join(out, `channel-${options.channel}.json`)
   await writeFile(documentPath, `${JSON.stringify(document, null, 2)}\n`, 'utf8')
 
   console.log(`package-runtime: ${basename(archive)} (${platform})`)

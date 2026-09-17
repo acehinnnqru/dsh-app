@@ -1,15 +1,25 @@
-# Publish a runtime for one channel.
+# OPTIONAL, MANUAL: publish a runtime for one channel from a GitHub runner.
 #
-# The shell updates its runtime in place (design doc D10), so a dsh release does
-# not require re-notarizing the app: this workflow produces the archive and the
-# channel document the updater reads. The document format is owned by
-# `src-tauri/src/channel.rs` and produced by `scripts/package-runtime.mjs`, so
-# this file must not invent either.
+# This is NOT the release path. The primary path is local — `nix build` plus
+# `scripts/package-runtime.mjs` on an Apple Silicon machine — because none of
+# this workflow has ever been executed and because the runner constraints below
+# make hosted runners a poor fit for a 478-package closure.
 #
-# Two channels share the machinery:
-#   release  follows the published @deepseek-ai/dsh version
-#   master   follows the harness main branch, built here
-name: runtime
+# What it records, so nobody has to rediscover it:
+#   * Only Apple Silicon macOS is supported, so there is a single platform here.
+#     Standard macOS runners are arm64; Intel (`macos-15-large`) needs a paid
+#     larger-runner plan, and the free `macos-13` image is retired.
+#   * `macos-15` is a current arm64 image. `macos-14` is deprecated, so pinning
+#     it would build on borrowed time.
+#   * Hosted macOS runners have ~14 GB of disk. The closure is 210 MB but its
+#     build needs the npm store, 482 Rust crates, and a Nix store on top.
+#     Expect to need the cleanup step below, or a self-hosted runner.
+#   * The Nix multi-user daemon installed by `nix-installer-action` is the most
+#     fragile part of this setup.
+#
+# The artifact format is owned by `src-tauri/src/channel.rs` and produced by
+# `scripts/package-runtime.mjs`. This file must not invent either.
+name: runtime (optional, manual)
 
 on:
   workflow_dispatch:
@@ -23,36 +33,42 @@ on:
         description: dsh version (release channel; empty means the pinned one)
         type: string
         default: ""
-  schedule:
-    # A daily probe for a newer published dsh. Cheap when nothing changed.
-    - cron: "17 3 * * *"
-
+      runner:
+        description: Runner label (empty means the hosted macos-15 arm64 image)
+        type: string
+        default: ""
 permissions:
   contents: write
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            platform: darwin-arm64
-          - runner: macos-13
-            platform: darwin-x64
-    runs-on: ${{ matrix.runner }}
+    # `runner` lets a self-hosted machine be used instead of a hosted one, which
+    # is the recommended option for this workload.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        # The image is ~14 GB and the build wants the npm store, the vendor
+        # directory for 482 crates, and a Nix store at once.
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /Users/runner/Library/Android /Users/runner/Library/Developer/CoreSimulator 2>/dev/null || true
+          df -h /
+
       - uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Resolve the version to build
+      - name: Resolve the version and platform to build
         id: resolve
         env:
           REQUESTED: ${{ inputs.version }}
           CHANNEL: ${{ inputs.channel || 'release' }}
         run: |
           set -euo pipefail
+          # The flake declares a single system, so the platform is a constant
+          # here rather than a matrix dimension.
+          echo "platform=darwin-arm64" >> "$GITHUB_OUTPUT"
           if [ "$CHANNEL" = "master" ]; then
             # A master runtime is built from the harness source, so its version
             # identifies the commit rather than a published release.
@@ -87,12 +103,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: runtime-${{ matrix.platform }}-${{ steps.resolve.outputs.version }}
+          name: runtime-${{ steps.resolve.outputs.platform }}-${{ steps.resolve.outputs.version }}
           path: dist/*.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: channel-${{ matrix.platform }}-${{ steps.resolve.outputs.version }}
+          name: channel-${{ steps.resolve.outputs.platform }}-${{ steps.resolve.outputs.version }}
           path: dist/*.json
 
   publish:
