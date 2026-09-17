@@ -1080,6 +1080,71 @@ GUI 里同时有一个按钮（两者都受"先停掉所有 preset"约束）。�
 - UI 只有"回滚"按钮，没有"检查更新"。
 
 
+## 16. M7 完成：Nix 产出 `.app`
+
+```
+nix build .#dsh-app-slim       # 壳 + 种子运行时，Node 走 PATH
+nix build .#dsh-app-bundled    # 上者 + 官方 Node（app 415MB，其中 Node 132MB）
+nix build .#dsh-runtime        # 仅闭包，供 CI 自行打包
+nix build .#node               # 官方 Node 归档（已固定哈希）
+```
+
+产物是未签名的 `.app`（右键打开即可），预装种子运行时与样例 preset。
+实测两个变体的差异精确符合预期：
+
+| 变体 | 解析到的 Node |
+|---|---|
+| bundled | `<app>/Contents/Resources/node/bin/node` |
+| slim | PATH 上的 node |
+
+### 16.1 为什么不走 `tauri build`（§5.2 的取舍落地）
+
+壳页面是三个静态文件，真正的 GUI 由运行时在运行时经 HTTP 提供。所以
+`frontendDist` 不需要工具链、`beforeBuildCommand` 为空，直接 `cargo build`
+再用 `packaging/assemble-app.sh` 组装 bundle 即可。
+
+那个脚本**本地打包与 Nix 共用**：bundle 布局是契约（壳从
+`Contents/Resources/runtimes` 找种子、从 `Resources/node/bin/node` 找 Node），
+两份实现必然漂移。
+
+### 16.2 沿用而不是复述
+
+闭包构建**复用 `scripts/prepare-runtime.mjs`**（新增 `DSH_BUILD_ROOT` 重定向输出），
+而不是在 Nix 里重写 pnpm deploy 的 flag。理由与 §11.1 那条 `auto-install-peers`
+同源：那些 flag 正是最容易在第二份实现里悄悄烂掉的部分。
+
+### 16.3 三个让构建静默失败的坑
+
+1. **`packageManager: pnpm@11.7.0` 会让 pnpm 自我切换版本。** flake 提供的是
+   11.25.0，pnpm 读到该字段后去下载 11.7.0；无网沙箱里它**什么都不做、退出码 0**，
+   于是 `pnpm deploy` 静默不产出。修法：flake 自己钉 `pkgs.pnpm`，删掉该字段
+   （工具链版本由 flake 声明，不该由 package.json 的字段间接决定）。
+2. **`runHook preBuild` 在没有对应 hook 时返回 1**，而 builder 跑在 `set -e` 下，
+   整个 buildPhase 静默中止——表现为若干步之后一个看似无关的 `chmod` 失败。
+   本仓库的 derivation 不再调用 `runHook`。
+3. **`cp <文件> <目录>/` 保留源文件名**，而 Nix store 路径带哈希前缀：产出
+   `1sc98ak…-assemble-app.sh`，更糟的是种子会落进以哈希命名的目录、壳按
+   manifest 里的版本号找不到。所有目标路径改为显式命名。
+
+### 16.4 顺带修掉的缺口
+
+`resolve_node` 原先**不查 bundle 内的 Node**，在用户机器上会跳过刚打进去的那份——
+那会让 bundled 变体完全失去意义。现在顺序是：`DSH_APP_NODE` → `.dsh-build/node`
+→ **bundle 内的 `Resources/node`** → PATH。
+
+启动时新增一行日志记录解析到的 runtime 与 node：打包后 Home 不再是仓库，
+"它到底用了哪个 Node"是排障第一问。
+
+### 16.5 M7 的已知未完成项
+
+- **闭包 derivation 不是 FOD**：它从 npm 解析，且**没有提交 lockfile**，
+  所以两次构建可能得到不同的 `@types/node` 版本（实测差 24 个 `.d.ts`，
+  无运行时影响）。用 `fetchPnpmDeps` + 离线安装固定下来是后续工作。
+- **`CFBundleShortVersionString` 仍是 0.0.0**：版本策略要等 M9 把 cask 的
+  版本语义定下来（D10 已定：cask version = 壳版本）。
+- 未做 DMG（`hdiutil` 在沙箱内未验证）、未签名、未公证。
+
+
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
 > 版本基线：tauri 2.11.5 / tauri-runtime-wry 2.11.4（wry 0.56.0）/ tao 0.37.0 / tauri-plugin-updater 2.11.0。
