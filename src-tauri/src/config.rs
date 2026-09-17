@@ -6,57 +6,11 @@
 //!
 //! @see docs/design-tauri-wrapper.md D3 (preset), D7 (runtime layout)
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::runtime_store::RuntimeStore;
+
 use serde::{Deserialize, Serialize};
-
-/// One preset: the ordered bundle stack plus the invocation facts it implies.
-///
-/// Not `Deserialize`: the preset *store* owns file parsing, so this type is only
-/// constructed in Rust and serialized for the UI.
-#[derive(Debug, Clone, Serialize)]
-pub struct Preset {
-    /// Stable id, also the default profile name.
-    pub id: String,
-    /// Human-facing label.
-    pub label: Option<String>,
-    /// `web` is the only kind this milestone implements.
-    pub kind: String,
-    /// Profile directory name under `<home>/profiles`.
-    pub profile: Option<String>,
-    /// Ordered `dsh.profile.bundles`; materialized on first boot only.
-    pub bundles: Option<Vec<String>>,
-    /// `startup` (default) or `live`; `live` makes internals capability required.
-    pub patch_reload: Option<String>,
-    /// Whitelisted environment additions.
-    pub env: BTreeMap<String, String>,
-}
-
-impl Preset {
-    /// The profile name this preset owns.
-    pub fn profile_name(&self) -> &str {
-        self.profile.as_deref().unwrap_or(&self.id)
-    }
-
-    /// The bundle stack to write when the profile is first materialized.
-    pub fn bundle_list(&self) -> Vec<String> {
-        self.bundles
-            .clone()
-            .unwrap_or_else(|| crate::profile_template::DEFAULT_WEB_BUNDLES.iter().map(|s| (*s).to_owned()).collect())
-    }
-
-    /// Effective patch-reload lifecycle.
-    pub fn patch_reload_value(&self) -> &str {
-        self.patch_reload.as_deref().unwrap_or("startup")
-    }
-
-    /// Whether this preset's profile mounts the HMR row and therefore needs
-    /// internals access (`--expose-internals` or the native addon).
-    pub fn needs_internals(&self) -> bool {
-        self.patch_reload_value() == "live"
-    }
-}
 
 /// A resolved runtime layout on disk.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,7 +79,7 @@ impl RuntimeManifest {
 
 /// The repository root, derived from the built binary's location so the shell
 /// works both from `target/debug` and from a bundle.
-fn repo_root() -> PathBuf {
+pub fn repo_root() -> PathBuf {
     // src-tauri/target/<profile>/dsh-app -> repo root is four levels up.
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let mut candidate = exe.as_path();
@@ -139,33 +93,75 @@ fn repo_root() -> PathBuf {
 
 /// The shell's home: where its presets and the runtime's `DSH_HOME` live.
 ///
+/// Public because startup needs it before any configuration can be loaded: the
+/// runtime store lives here, and the store is what the configuration is built
+/// from.
+///
 /// `DSH_APP_HOME` overrides it, which is what makes an isolated run possible
 /// (`DSH_APP_HOME=$(mktemp -d) dsh-app`) and lets a developer point the shell at
 /// their real `~/.dsh` to share configuration with the CLI. Otherwise the
 /// repository-local default keeps sessions out of the user's own harness home.
-fn resolve_home(root: &Path) -> PathBuf {
+pub fn resolve_home(root: &Path) -> PathBuf {
     match std::env::var("DSH_APP_HOME") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => root.join(".dsh-build").join("home"),
     }
 }
 
-/// Build the development configuration from `.dsh-build`.
+/// Resolve the shell's configuration.
 ///
-/// Node resolution follows D2's precedence: an explicit `DSH_APP_NODE`, then a
-/// runtime-local `node/bin/node`, then the newest official archive under
-/// `.dsh-build/node`, then `PATH`.
-pub fn development_config() -> Result<AppConfig, String> {
+/// The runtime is served from the store under the shell's home (design doc D10):
+/// the app bundle carries only a seed, and updates replace the store copy. An
+/// already-populated store therefore wins, and `.dsh-build/runtimes` is used
+/// only until the first seed has been installed — which keeps a fresh checkout
+/// working with nothing but `pnpm runtime:prepare`.
+///
+/// Node resolution follows D2's precedence: `DSH_APP_NODE`, then the bundled
+/// official archive, then `PATH`.
+pub fn load(home: &Path, store: &RuntimeStore) -> Result<AppConfig, String> {
     let root = repo_root();
-    let runtimes = root.join(".dsh-build").join("runtimes");
-    let dir = newest_runtime_dir(&runtimes)?;
+    let dir = match store.active_dir() {
+        Some(dir) => dir,
+        None => newest_runtime_dir(&root.join(".dsh-build").join("runtimes"))?,
+    };
     let manifest = RuntimeManifest::load(&dir)?;
     let node = resolve_node(&root, &manifest)?;
 
     Ok(AppConfig {
-        home: resolve_home(&root),
+        home: home.to_path_buf(),
         runtime: RuntimeConfig { dir, node },
     })
+}
+
+/// The first-run seed runtime the bundle carries, if any.
+///
+/// Resolved at runtime rather than staged into `OUT_DIR`, because the closure is
+/// hundreds of megabytes: copying it on every build would dominate build time,
+/// and a build-script copy would silently go stale whenever
+/// `pnpm runtime:prepare` rebuilt it. Candidate layouts, in order:
+///
+/// * a packaged app — `<bundle>/Contents/Resources/runtimes/<id>/`
+/// * a development build — `<repo>/.dsh-build/runtimes/<id>/`
+pub fn seed_runtime_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let beside_exe = exe.parent()?.join("seed-runtime");
+    let resources = exe.parent()?.join("../Resources/runtimes");
+    let develop = repo_root().join(".dsh-build").join("runtimes");
+    for candidate in [beside_exe, resources, develop] {
+        if let Some(seed) = newest_runtime_dir(&candidate).ok() {
+            return Some(seed);
+        }
+    }
+    None
+}
+
+/// Resolve the Node executable for one runtime directory.
+///
+/// Public so the activation smoke test can launch a candidate that is not yet
+/// the active runtime.
+pub fn resolve_node_for(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let manifest = RuntimeManifest::load(dir)?;
+    resolve_node(root, &manifest)
 }
 
 /// The Node version the shell bundles, read from the root manifest's pin.

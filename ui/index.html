@@ -29,8 +29,12 @@
       <details class="facts-wrap">
         <summary>Runtime</summary>
         <dl class="facts">
-          <dt>Runtime</dt>
-          <dd id="fact-runtime" class="mono">—</dd>
+          <dt>Active</dt>
+          <dd id="fact-active" class="mono">—</dd>
+          <dt>dsh</dt>
+          <dd id="fact-dsh" class="mono">—</dd>
+          <dt>Previous</dt>
+          <dd id="fact-previous" class="mono">—</dd>
           <dt>Node</dt>
           <dd id="fact-node" class="mono">—</dd>
           <dt>Home</dt>
@@ -38,6 +42,10 @@
           <dt>Shell</dt>
           <dd id="fact-ui" class="mono">—</dd>
         </dl>
+        <div class="actions runtime-actions">
+          <button id="rollback" type="button" disabled
+                  title="Switch back to the previous runtime">Roll back runtime</button>
+        </div>
       </details>
     </main>
     <script type="module" src="shell.js"></script>

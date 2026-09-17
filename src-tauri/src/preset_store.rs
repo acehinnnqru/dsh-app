@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Preset;
+use crate::preset::Preset;
 
 /// Directory holding preset files, under the shell's own home.
 pub const PRESETS_DIR: &str = "dsh-app/presets";

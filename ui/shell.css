@@ -167,3 +167,5 @@ details pre {
   user-select: text;
   white-space: pre-wrap;
 }
+
+.runtime-actions { margin-top: 10px; }

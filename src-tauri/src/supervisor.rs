@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::Preset;
+use crate::preset::Preset;
 
 /// Readiness timeout: how long the launcher may take to print its URL line.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);

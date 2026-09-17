@@ -30,6 +30,9 @@
     "category": "DeveloperTool",
     "icon": [
       "icons/icon.icns"
-    ]
+    ],
+    "resources": {
+      "gen/seed-runtime": "runtimes"
+    }
   }
 }

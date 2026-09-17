@@ -11,9 +11,12 @@
 
 mod config;
 mod node_probe;
+mod preset;
 mod preset_store;
 mod profile;
 mod profile_template;
+mod runtime_store;
+mod smoke;
 mod supervisor;
 
 use std::collections::BTreeMap;
@@ -24,7 +27,10 @@ use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 use config::AppConfig;
 use node_probe::NodeProbeCache;
+use preset::Preset;
 use preset_store::ResolvedPreset;
+use runtime_store::RuntimeStore;
+use smoke::smoke;
 use supervisor::{Phase, SupervisedChild};
 
 /// The shell's own page, compiled into the binary from `ui/`.
@@ -43,6 +49,8 @@ struct ShellState {
     children: BTreeMap<String, SupervisedChild>,
     /// Problems found while loading state, surfaced in the UI.
     problems: Vec<String>,
+    /// The runtime store this installation serves from.
+    store: RuntimeStore,
     /// Capability verdicts for candidate Node executables.
     node_probe: NodeProbeCache,
     /// Whether the launcher had to pass `--expose-internals` because the
@@ -118,6 +126,7 @@ impl ShellState {
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "uiVersion": UI_VERSION,
+            "runtime": self.store.status(),
             "home": self.config.home.display().to_string(),
             "runtimeDir": self.config.runtime.dir.display().to_string(),
             "node": self.config.runtime.node.display().to_string(),
@@ -125,6 +134,21 @@ impl ShellState {
             "problems": self.problems,
         })
     }
+}
+
+/// Roll back to the previous runtime.
+///
+/// Refuses while any preset is running: the running children hold the old
+/// runtime open, and D3.4's ordering rule is that a version change happens with
+/// everything stopped.
+#[tauri::command]
+fn rollback_runtime(state: tauri::State<'_, Mutex<ShellState>>) -> Result<String, String> {
+    let state = lock_state(&state)?;
+    if !state.children.is_empty() {
+        return Err("stop every running preset before changing the runtime version".to_owned());
+    }
+    let id = state.store.rollback()?;
+    Ok(id)
 }
 
 /// Sample presets staged by `build.rs`, seeded into the home on first run.
@@ -446,16 +470,95 @@ fn install_page_probe(app: &tauri::AppHandle) {
     eprintln!("[dsh-app] page-probe injected: {}", injected.is_ok());
 }
 
+/// Act on flags that must work before (or without) a window.
+///
+/// `--rollback` is a recovery path, not a convenience: if a bad runtime keeps
+/// the shell from coming up usefully, this is how the user gets back to the
+/// previous one from a terminal. It returns the process exit code.
+fn handle_startup_flags(store: &RuntimeStore) -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|arg| arg == "--rollback") {
+        return None;
+    }
+    match store.rollback() {
+        Ok(id) => {
+            println!("dsh-app: rolled back to {id}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("dsh-app: rollback failed: {error}");
+            Some(1)
+        }
+    }
+}
+
 /// Build and run the shell.
 pub fn run() {
     let mut problems = Vec::new();
-    let config = match config::development_config() {
+    let root = config::repo_root();
+    let home = config::resolve_home(&root);
+    let store = RuntimeStore::new(&home);
+
+    // First run installs the seed the bundle carries, so a packaged app boots
+    // offline and a checkout needs only `pnpm runtime:prepare` (design doc U3).
+    if let Some(seed) = config::seed_runtime_dir() {
+        if let Some(id) = seed.file_name().map(|name| name.to_string_lossy().into_owned()) {
+            match store.install(&id, &seed) {
+                Ok(installed) => {
+                    if installed {
+                        eprintln!("[dsh-app] installed the seed runtime {id}");
+                    }
+                    // Activate only when nothing is active: an update the user
+                    // already applied must not be reverted by a stale seed.
+                    if store.active_dir().is_none() {
+                        // Mandatory gate (design doc D8.2 U1): nothing else proves
+                        // this runtime can be launched by this shell, so a seed
+                        // that cannot boot must not become the active runtime.
+                        let dir = store.root().join(&id);
+                        let node = config::resolve_node_for(&root, &dir);
+                        match node {
+                            Ok(node) => {
+                                let report = smoke::smoke(&dir, &node, &smoke::smoke_home(&home), Vec::new());
+                                if report.ok {
+                                    eprintln!(
+                                        "[dsh-app] seed runtime {id} passed its smoke test ({})",
+                                        report.url.as_deref().unwrap_or("no url")
+                                    );
+                                    if let Err(error) = store.activate(&id) {
+                                        problems.push(error);
+                                    }
+                                } else {
+                                    problems.push(format!(
+                                        "the seed runtime {id} failed its smoke test and was not activated: {}",
+                                        report.detail.unwrap_or_else(|| "unknown reason".to_owned())
+                                    ));
+                                }
+                            }
+                            Err(error) => problems.push(error),
+                        }
+                    }
+                    if let Err(error) = store.record_seed(&id) {
+                        problems.push(error);
+                    }
+                }
+                Err(error) => problems.push(error),
+            }
+        }
+    }
+
+    // Before anything opens a window: a recovery flag must not depend on the
+    // shell being able to start.
+    if let Some(code) = handle_startup_flags(&store) {
+        std::process::exit(code);
+    }
+
+    let config = match config::load(&home, &store) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("[dsh-app] {error}");
             problems.push(error);
             AppConfig {
-                home: PathBuf::from("."),
+                home: home.clone(),
                 runtime: config::RuntimeConfig {
                     dir: PathBuf::from("."),
                     node: PathBuf::from("node"),
@@ -481,6 +584,7 @@ pub fn run() {
             presets,
             children: BTreeMap::new(),
             problems,
+            store,
             node_probe: NodeProbeCache::default(),
             expose_internals: false,
         }))
@@ -490,7 +594,8 @@ pub fn run() {
             open_harness,
             stop_preset,
             start_preset_command,
-            reload_presets
+            reload_presets,
+            rollback_runtime
         ])
         .setup(move |app| {
             let probe_handle = app.handle().clone();

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::Preset;
+use crate::preset::Preset;
 use crate::profile_template;
 
 /// The profile directory for one preset under a harness home.

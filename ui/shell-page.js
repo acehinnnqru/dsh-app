@@ -12,8 +12,11 @@ const el = {
   empty: document.getElementById('empty'),
   problems: document.getElementById('problems'),
   reload: document.getElementById('reload'),
-  runtime: document.getElementById('fact-runtime'),
+  active: document.getElementById('fact-active'),
+  dsh: document.getElementById('fact-dsh'),
+  previous: document.getElementById('fact-previous'),
   node: document.getElementById('fact-node'),
+  rollback: document.getElementById('rollback'),
   home: document.getElementById('fact-home'),
   ui: document.getElementById('fact-ui'),
 };
@@ -104,9 +107,22 @@ function render() {
   el.problems.hidden = problems.length === 0;
   el.problems.textContent = problems.join('\n');
 
-  el.runtime.textContent = state.runtimeDir ?? '—';
+  const runtime = state.runtime ?? {};
+  el.active.textContent = runtime.active ?? '—';
+  el.dsh.textContent = runtime.active_dsh_version ?? '—';
+  el.previous.textContent = runtime.previous ?? '(none)';
   el.node.textContent = state.node ?? '—';
   el.home.textContent = state.home ?? '—';
+
+  // A version change happens with everything stopped (design doc D3.4), and the
+  // host enforces the same rule, so the button says so rather than failing late.
+  const anyRunning = state.presets.some((preset) => preset.phase !== 'idle');
+  el.rollback.disabled = !runtime.previous || anyRunning;
+  el.rollback.title = !runtime.previous
+    ? 'No previous runtime is available'
+    : anyRunning
+      ? 'Stop every running preset first'
+      : 'Switch back to the previous runtime';
   // Proves which page build is running, so "fields stayed empty" can never be
   // diagnosed from a screenshot of stale UI again.
   el.ui.textContent = state.uiVersion ?? '—';
@@ -120,6 +136,15 @@ async function refresh() {
   }
   render();
 }
+
+el.rollback.addEventListener('click', async () => {
+  try {
+    await invoke('rollback_runtime');
+  } catch (error) {
+    state.problems = [...(state.problems ?? []), String(error)];
+  }
+  await refresh();
+});
 
 el.reload.addEventListener('click', async () => {
   try {
