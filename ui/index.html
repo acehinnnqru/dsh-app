@@ -39,10 +39,17 @@
           <dd id="fact-node" class="mono">—</dd>
           <dt>Home</dt>
           <dd id="fact-home" class="mono">—</dd>
+          <dt>Channel</dt>
+          <dd id="fact-channel" class="mono">—</dd>
           <dt>Shell</dt>
           <dd id="fact-ui" class="mono">—</dd>
         </dl>
+        <p id="update-note" class="update-note" hidden></p>
         <div class="actions runtime-actions">
+          <button id="check-update" type="button"
+                  title="Ask the channel whether a newer runtime exists">Check for updates</button>
+          <button id="apply-update" type="button" disabled
+                  title="Download, verify, and activate the newest runtime">Install update</button>
           <button id="rollback" type="button" disabled
                   title="Switch back to the previous runtime">Roll back runtime</button>
         </div>

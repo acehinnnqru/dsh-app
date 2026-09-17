@@ -15,6 +15,10 @@ const el = {
   active: document.getElementById('fact-active'),
   dsh: document.getElementById('fact-dsh'),
   previous: document.getElementById('fact-previous'),
+  channel: document.getElementById('fact-channel'),
+  note: document.getElementById('update-note'),
+  check: document.getElementById('check-update'),
+  apply: document.getElementById('apply-update'),
   node: document.getElementById('fact-node'),
   rollback: document.getElementById('rollback'),
   home: document.getElementById('fact-home'),
@@ -117,6 +121,31 @@ function render() {
   // A version change happens with everything stopped (design doc D3.4), and the
   // host enforces the same rule, so the button says so rather than failing late.
   const anyRunning = state.presets.some((preset) => preset.phase !== 'idle');
+  const channel = state.channel ?? {};
+  el.channel.textContent = channel.url ?? '(none configured)';
+
+  // An update is offered only when one exists and nothing is running: the
+  // runtime in use cannot be replaced under a live child (design doc D3.4).
+  const check = channel.lastCheck;
+  const available = Boolean(check?.update_available);
+  el.apply.disabled = !available || anyRunning;
+  el.check.disabled = !channel.url;
+
+  const notes = [];
+  if (check) {
+    if (check.update_available) {
+      notes.push(`Update available: ${check.current ?? '(none)'} → ${check.available}`);
+    } else if (check.available) {
+      notes.push(`Up to date (${check.available}).`);
+    } else if (check.detail) {
+      notes.push(check.detail);
+    }
+  }
+  if (available && anyRunning) notes.push('Stop every running preset to install it.');
+  notes.push(`platform ${channel.platform ?? '?'} · shellContract ${channel.shellContract ?? '?'}`);
+  el.note.hidden = false;
+  el.note.textContent = notes.join(' ');
+
   el.rollback.disabled = !runtime.previous || anyRunning;
   el.rollback.title = !runtime.previous
     ? 'No previous runtime is available'
@@ -136,6 +165,30 @@ async function refresh() {
   }
   render();
 }
+
+el.check.addEventListener('click', async () => {
+  el.note.hidden = false;
+  el.note.textContent = 'Checking…';
+  try {
+    await invoke('check_update');
+  } catch (error) {
+    state.problems = [...(state.problems ?? []), String(error)];
+  }
+  await refresh();
+});
+
+el.apply.addEventListener('click', async () => {
+  el.note.hidden = false;
+  el.note.textContent = 'Downloading and verifying… the window stays usable.';
+  try {
+    const outcome = await invoke('apply_update');
+    state.problems = [];
+    el.note.textContent = `Activated ${outcome.activated} (replaced ${outcome.replaced ?? 'nothing'}).`;
+  } catch (error) {
+    state.problems = [...(state.problems ?? []), String(error)];
+  }
+  await refresh();
+});
 
 el.rollback.addEventListener('click', async () => {
   try {

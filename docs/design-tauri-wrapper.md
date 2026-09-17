@@ -1145,6 +1145,74 @@ nix build .#node               # 官方 Node 归档（已固定哈希）
 - 未做 DMG（`hdiutil` 在沙箱内未验证）、未签名、未公证。
 
 
+## 17. M6 完成：通道检查与运行时更新
+
+M5 只验证了"安装"与"回滚"两个端点，中间的**更新**这一整段是空的。M6 补上了它。
+
+### 17.1 发布清单格式（壳与 CI 之间的接口）
+
+`channel.rs` 读取一份很小的 JSON：
+
+```json
+{
+  "channel": "release",
+  "releases": [
+    { "version": "0.1.6", "platform": "darwin-arm64",
+      "tarball": "https://…/dsh-runtime-0.1.6-darwin-arm64.tar.gz",
+      "sha256": "…", "shellContract": 1 }
+  ]
+}
+```
+
+**按平台分别发布，而不是一份通用归档**：闭包在构建它的机器上解析原生包
+（`node-pty`、`koffi`、`require-builtin` addon），一份通用归档等于把某个平台的二进制
+发给所有平台。反过来"在用户机器上解析"又意味着要带上 pnpm 与 store——那正是展开式闭包
+要避免的东西。
+
+`shellContract` 让运行时声明它需要的壳能力（D6 的契约）；壳拒绝高于自身契约的条目。
+
+### 17.2 `scripts/package-runtime.mjs` 是三处约定的唯一生产者
+
+归档布局、平台标签、摘要都由它产出，因为三者必须与 `channel.rs` 一致。**平台标签统一
+为 Node 的拼写**（`darwin-arm64`，不是 Rust 的 `macos-aarch64`）——它同时出现在
+`runtime.json`、官方 Node 归档名和打包脚本里，出现第二种拼写就会静默失配。这个不一致
+在实现时真的出现了，并已修正。
+
+同时给下载加了一道平台校验：发布归档是平台特定的，拿错平台应当在激活前被拒，而不是
+在首次启动时表现为 ABI 失败。
+
+### 17.3 实测（端到端）
+
+用本地 `file://` 渠道与桩运行时（会打印就绪行，因此就绪解析与冒烟门禁都被真正走过）：
+
+| 场景 | 结果 |
+|---|---|
+| `--check-update` | `0.1.5-rc.1 → 0.1.6`，`update_available: true` |
+| `--update-runtime` | activated `0.1.6-darwin-arm64`、smoke_url 已脱敏、`replaced` 记下旧版 |
+| 打包脚本产出的归档（`0.1.9`）再走一遍 | 同样成功 —— 打包与更新两侧用的是同一份约定 |
+| 摘要不匹配 | **拒绝**，报出 expected/actual，`active` 不变，无残留文件 |
+| 平台不匹配 | **拒绝**（"the published runtime is for … but this machine is …"），现状不变 |
+| `--rollback` | 退回 `release-0.1.5-rc.1` |
+
+更新后 `previous` 指向被替换的版本，所以"更新坏了就退回去"这条链是闭合的。
+
+### 17.4 `--check-update` / `--update-runtime` 是能力而非测试后门
+
+与 `--rollback` 同源的理由：**更新恰恰是 GUI 不可用时用户要做的事**，只留 GUI 一条路径
+是设计缺陷。它们也是这条路径能在没有窗口的情况下被验证的原因。
+
+### 17.5 已知未验证的部分
+
+- **CI 工作流（`.github/workflows/runtime.yml`）从未运行过**：它产出的归档格式与
+  `package-runtime.mjs` 一致（本地已测），但 workflow 本身（Nix 安装、双平台矩阵、
+  artifact 合并、gh release 上传）没有执行过。合并步骤里"多平台合成一份 channel 文档"
+  尤其未经真实运行。
+- **`dsh-app@master` 的 cask 与 master 通道的 harness 源码构建**未做：当前 master 只是
+  工作流里的一个参数分支，它会构建**本仓库的闭包**而非 harness `main`。真正跟随
+  harness main 需要在 CI 里 checkout 上游并构建，这是 M6 明确遗留的部分。
+- 渠道 URL 目前只能由 store.json 手工写入；"安装时按 cask 决定渠道"要等 M9。
+
+
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
 > 版本基线：tauri 2.11.5 / tauri-runtime-wry 2.11.4（wry 0.56.0）/ tao 0.37.0 / tauri-plugin-updater 2.11.0。

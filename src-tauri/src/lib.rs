@@ -9,6 +9,7 @@
 //! distinct profile and nothing else is shared; the invariants that keep it safe
 //! are documented in the design doc D3.4 and enforced here.
 
+mod channel;
 mod config;
 mod node_probe;
 mod preset;
@@ -54,6 +55,8 @@ struct ShellState {
     /// Whether the launcher had to pass `--expose-internals` because the
     /// selected Node cannot use the native addon.
     expose_internals: bool,
+    /// The most recent update check, for the UI.
+    last_check: Option<channel::UpdateCheck>,
 }
 
 impl ShellState {
@@ -125,6 +128,12 @@ impl ShellState {
         serde_json::json!({
             "uiVersion": UI_VERSION,
             "runtime": self.store.status(),
+            "channel": {
+                "url": self.store.channel_url(),
+                "platform": channel::platform_tag(),
+                "shellContract": channel::SHELL_CONTRACT,
+                "lastCheck": self.last_check,
+            },
             "home": self.config.home.display().to_string(),
             "runtimeDir": self.config.runtime.dir.display().to_string(),
             "node": self.config.runtime.node.display().to_string(),
@@ -132,6 +141,55 @@ impl ShellState {
             "problems": self.problems,
         })
     }
+}
+
+/// Ask the configured channel whether a newer runtime exists.
+#[tauri::command]
+fn check_update(state: tauri::State<'_, Mutex<ShellState>>) -> Result<serde_json::Value, String> {
+    let mut state = lock_state(&state)?;
+    let url = state
+        .store
+        .channel_url()
+        .ok_or_else(|| "this installation has no update channel configured".to_owned())?;
+    let check = channel::check(&state.store, &url)?;
+    let payload = serde_json::to_value(&check).map_err(|error| error.to_string())?;
+    state.last_check = Some(check);
+    Ok(payload)
+}
+
+/// Download, verify, smoke-test, and activate the newest release.
+#[tauri::command]
+fn apply_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<ShellState>>,
+) -> Result<serde_json::Value, String> {
+    // A version change happens with everything stopped (design doc D3.4), and
+    // the runtime in use cannot be replaced under a running child.
+    let (store_root, home, node, url) = {
+        let state = lock_state(&state)?;
+        if !state.children.is_empty() {
+            return Err("stop every running preset before updating the runtime".to_owned());
+        }
+        (
+            state.store.root().to_path_buf(),
+            state.config.home.clone(),
+            state.config.runtime.node.clone(),
+            state
+                .store
+                .channel_url()
+                .ok_or_else(|| "this installation has no update channel configured".to_owned())?,
+        )
+    };
+    // The store is re-derived from its root so the lock is not held across a
+    // download, which can take minutes.
+    let store = RuntimeStore::new(&home);
+    debug_assert_eq!(store.root(), store_root.as_path());
+
+    let _ = app.emit("dsh://status", serde_json::json!({ "phase": "updating" }));
+    let outcome = channel::update(&store, &url, &node, &smoke::smoke_home(&home), Vec::new())?;
+    let payload = serde_json::to_value(&outcome).map_err(|error| error.to_string())?;
+    let _ = app.emit("dsh://status", serde_json::json!({ "phase": "updated" }));
+    Ok(payload)
 }
 
 /// Roll back to the previous runtime.
@@ -473,21 +531,45 @@ fn install_page_probe(app: &tauri::AppHandle) {
 /// `--rollback` is a recovery path, not a convenience: if a bad runtime keeps
 /// the shell from coming up usefully, this is how the user gets back to the
 /// previous one from a terminal. It returns the process exit code.
-fn handle_startup_flags(store: &RuntimeStore) -> Option<i32> {
+fn handle_startup_flags(store: &RuntimeStore, home: &std::path::Path, node: &std::path::Path) -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.iter().any(|arg| arg == "--rollback") {
-        return None;
-    }
-    match store.rollback() {
-        Ok(id) => {
-            println!("dsh-app: rolled back to {id}");
-            Some(0)
+    let report = |result: Result<String, String>| -> i32 {
+        match result {
+            Ok(message) => {
+                println!("dsh-app: {message}");
+                0
+            }
+            Err(error) => {
+                eprintln!("dsh-app: {error}");
+                1
+            }
         }
-        Err(error) => {
-            eprintln!("dsh-app: rollback failed: {error}");
-            Some(1)
-        }
+    };
+
+    if args.iter().any(|arg| arg == "--rollback") {
+        return Some(report(store.rollback().map(|id| format!("rolled back to {id}"))));
     }
+    if args.iter().any(|arg| arg == "--check-update") {
+        let url = match store.channel_url() {
+            Some(url) => url,
+            None => return Some(report(Err("no update channel is configured".to_owned()))),
+        };
+        return Some(report(channel::check(store, &url).and_then(|check| {
+            serde_json::to_string_pretty(&check).map_err(|error| error.to_string())
+        })));
+    }
+    if args.iter().any(|arg| arg == "--update-runtime") {
+        let url = match store.channel_url() {
+            Some(url) => url,
+            None => return Some(report(Err("no update channel is configured".to_owned()))),
+        };
+        return Some(report(
+            channel::update(store, &url, node, &smoke::smoke_home(home), Vec::new()).and_then(|outcome| {
+                serde_json::to_string_pretty(&outcome).map_err(|error| error.to_string())
+            }),
+        ));
+    }
+    None
 }
 
 /// Build and run the shell.
@@ -544,9 +626,14 @@ pub fn run() {
         }
     }
 
-    // Before anything opens a window: a recovery flag must not depend on the
-    // shell being able to start.
-    if let Some(code) = handle_startup_flags(&store) {
+    // Before anything opens a window: these must not depend on the shell being
+    // able to start, and updating is exactly what a user does when the GUI is
+    // unusable. They are also how the update path is exercised end to end
+    // without a window.
+    let flag_node = config::load(&home, &store)
+        .map(|config| config.runtime.node)
+        .unwrap_or_else(|_| PathBuf::from("node"));
+    if let Some(code) = handle_startup_flags(&store, &home, &flag_node) {
         std::process::exit(code);
     }
 
@@ -596,6 +683,7 @@ pub fn run() {
             store,
             node_probe: NodeProbeCache::default(),
             expose_internals: false,
+            last_check: None,
         }))
         .invoke_handler(tauri::generate_handler![
             shell_state,
@@ -604,7 +692,9 @@ pub fn run() {
             stop_preset,
             start_preset_command,
             reload_presets,
-            rollback_runtime
+            rollback_runtime,
+            check_update,
+            apply_update
         ])
         .setup(move |app| {
             let probe_handle = app.handle().clone();

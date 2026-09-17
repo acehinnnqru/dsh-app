@@ -58,7 +58,9 @@ function archiveName(version) {
   if (process.platform !== 'darwin') {
     throw new Error(`prepare-node: ${process.platform} is not a supported target yet (macOS only)`)
   }
-  return `node-v${version}-${process.platform}-${process.arch}.tar.gz`
+  // Node's own arch spelling, matching `channel::platform_tag` on the Rust side.
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+  return `node-v${version}-${process.platform}-${arch}.tar.gz`
 }
 
 /** Download a URL into memory. */

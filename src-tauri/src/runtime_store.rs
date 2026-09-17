@@ -37,6 +37,10 @@ pub struct StoreState {
     /// The version rollback returns to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    /// The channel document this installation checks for updates. Set by the
+    /// packaging step (a release cask and a master cask differ only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_url: Option<String>,
 }
 
 /// What the store currently holds.
@@ -227,6 +231,18 @@ impl RuntimeStore {
         let mut state = self.state();
         state.seed = Some(seed.to_owned());
         self.write_state(&state)
+    }
+
+    /// Record the channel document to check for updates.
+    pub fn set_channel_url(&self, url: &str) -> Result<(), String> {
+        let mut state = self.state();
+        state.channel_url = Some(url.to_owned());
+        self.write_state(&state)
+    }
+
+    /// The channel document to check, if one has been configured.
+    pub fn channel_url(&self) -> Option<String> {
+        self.state().channel_url
     }
 
     /// Write the bookkeeping, creating the directory when needed.
