@@ -224,6 +224,7 @@
         mkApp = {
           name,
           withNode,
+          withPnpm,
           withSeed,
         }:
           pkgs.stdenv.mkDerivation {
@@ -274,6 +275,33 @@
                 mkdir -p "$work/out/dsh-app.app/Contents/Resources/node"
                 cp -R ${officialNode}/. "$work/out/dsh-app.app/Contents/Resources/node/"
               ''}
+
+              ${lib.optionalString withPnpm ''
+                # pnpm is what `dsh plugin` forwards to, so without it plugin
+                # management cannot work at all (the CLI shells out to `pnpm` on
+                # PATH and exits 127 when it is absent).
+                #
+                # The package's own `bin/pnpm` is a symlink to `pnpm.mjs` whose
+                # shebang names a Node in the Nix store, which would neither exist
+                # on a user's machine nor pass the hardened runtime's library
+                # check. So the JavaScript is shipped as data and reached through a
+                # wrapper that runs it with the Node this bundle carries.
+                mkdir -p "$work/out/dsh-app.app/Contents/Resources/pnpm" \
+                         "$work/out/dsh-app.app/Contents/Resources/bin"
+                cp -R ${pnpm}/libexec/pnpm/. "$work/out/dsh-app.app/Contents/Resources/pnpm/"
+                cat > "$work/out/dsh-app.app/Contents/Resources/bin/pnpm" <<'PNPM_WRAPPER'
+#!/bin/sh
+# Run the bundled pnpm with the bundled Node.
+#
+# The path is resolved from this script's own location so the app keeps working
+# when the bundle is moved. `exec` keeps pnpm's exit status intact, which
+# `dsh plugin` forwards.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$here/node/bin/node" "$here/pnpm/bin/pnpm.mjs" "$@"
+PNPM_WRAPPER
+                chmod 755 "$work/out/dsh-app.app/Contents/Resources/bin/pnpm"
+              ''}
             '';
 
             installPhase = ''
@@ -290,20 +318,27 @@
           # The official Node archive, pinned by hash.
           node = officialNode;
           # Shell + seed runtime, relying on the user's own Node (design doc D2).
+          #
+          # The two variants differ by exactly one thing: the runtime a plugin
+          # needs. `bundled` carries Node and pnpm and needs no configuration;
+          # `slim` carries neither, so the user names a Node (per preset or via
+          # `DSH_APP_NODE`) and plugin management needs one on PATH.
           dsh-app-slim = mkApp {
             name = "dsh-app-slim";
             withNode = false;
+            withPnpm = false;
             withSeed = dshRuntime;
           };
-          # Shell + seed runtime + bundled official Node.
           dsh-app-bundled = mkApp {
             name = "dsh-app-bundled";
             withNode = true;
+            withPnpm = true;
             withSeed = dshRuntime;
           };
           default = mkApp {
             name = "dsh-app-bundled";
             withNode = true;
+            withPnpm = true;
             withSeed = dshRuntime;
           };
         };
