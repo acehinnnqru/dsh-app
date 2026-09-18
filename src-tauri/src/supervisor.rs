@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -87,24 +87,34 @@ pub fn parse_ready_line(line: &str) -> Option<String> {
 
 /// Build the child environment: never inherit `NODE_OPTIONS` or package-manager
 /// state (the harness Electron shell strips the same names).
-fn child_environment(home: &PathBuf, preset: &Preset) -> BTreeMap<String, String> {
+///
+/// `pnpm` is the executable the user named, when they named one. `dsh plugin` runs
+/// `pnpm` from PATH in the profile directory, so whoever we want it to find has to
+/// come first: the user's choice when there is one, otherwise the copy the
+/// `bundled` variant carries. Without either, the command fails with exit 127 —
+/// which is the whole of what a missing pnpm costs, because pnpm never gates the
+/// GUI (spec §4).
+fn child_environment(home: &PathBuf, preset: &Preset, pnpm: &Path) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    // `dsh plugin` runs `pnpm` from PATH in the profile directory, so the bundle
-    // has to make its own pnpm the first one found — on a machine without pnpm
-    // the command otherwise fails with exit 127. It is unconditional because
-    // deciding by existence would make the environment depend on what else
-    // happens to be installed.
-    if let Ok(exe) = std::env::current_exe() {
+    let mut path_prefix: Option<PathBuf> = None;
+
+    if let Some(dir) = pnpm.parent() {
+        path_prefix = Some(dir.to_path_buf());
+    } else if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let bundled_bin = dir.join("../Resources/bin");
             if bundled_bin.is_dir() {
-                let existing = std::env::var("PATH").unwrap_or_default();
-                env.insert(
-                    "PATH".to_owned(),
-                    format!("{}:{existing}", bundled_bin.display()),
-                );
+                path_prefix = Some(bundled_bin);
             }
         }
+    }
+
+    if let Some(dir) = path_prefix {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        env.insert(
+            "PATH".to_owned(),
+            format!("{}:{existing}", dir.display()),
+        );
     }
     for (name, value) in std::env::vars() {
         if name == "NODE_OPTIONS" || name.starts_with("DSH_") {
@@ -123,22 +133,50 @@ fn child_environment(home: &PathBuf, preset: &Preset) -> BTreeMap<String, String
     env
 }
 
+/// What one launch needs to know about the machine.
+///
+/// Grouped because they travel together and are all decided by the shell before
+/// the launch: which Node runs the closure, what to run, where, which home the
+/// child gets, and which pnpm `dsh plugin` should find.
+pub struct Launch {
+    /// The resolved Node, with where it came from.
+    pub node: ResolvedNode,
+    /// The closure's `lib/bin.js`.
+    pub entry: PathBuf,
+    /// Working directory — the runtime directory.
+    pub cwd: PathBuf,
+    /// The `DSH_HOME` the child is given.
+    pub home: PathBuf,
+    /// The user's pnpm, when they named one; a default is a bare `pnpm`.
+    pub pnpm: PathBuf,
+}
+
+impl Launch {
+    /// A launch with no user-chosen pnpm, so `dsh plugin` finds only the bundle's.
+    pub fn without_pnpm(node: ResolvedNode, entry: PathBuf, cwd: PathBuf, home: PathBuf) -> Self {
+        Self {
+            node,
+            entry,
+            cwd,
+            home,
+            pnpm: PathBuf::from("pnpm"),
+        }
+    }
+}
+
 impl SupervisedChild {
     /// Spawn the launcher and wait for its readiness line.
     ///
-    /// `entry` is the closure's `lib/bin.js`; `node` the executable that runs it.
     /// `patch_files` become repeatable `--patch` overlays, which sit at the top
     /// of the patch stack in argv order, so preset layers win over bundle and
     /// profile layers without touching the profile's own patch file.
     pub fn start(
         preset: Preset,
-        node: ResolvedNode,
-        entry: PathBuf,
-        cwd: PathBuf,
-        home: PathBuf,
+        launch: Launch,
         patch_files: Vec<PathBuf>,
         node_args: Vec<String>,
     ) -> Result<Self, String> {
+        let Launch { node, entry, cwd, home, pnpm } = launch;
         // Node's own flags precede the script; passing them as argv entries
         // rather than through NODE_OPTIONS keeps the child environment clean
         // (that variable is stripped from inherited state for the same reason).
@@ -161,7 +199,7 @@ impl SupervisedChild {
             .args(&args)
             .current_dir(&cwd)
             .env_clear()
-            .envs(child_environment(&home, &preset))
+            .envs(child_environment(&home, &preset, &pnpm))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

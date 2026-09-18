@@ -23,6 +23,14 @@ const el = {
   rollback: document.getElementById('rollback'),
   home: document.getElementById('fact-home'),
   ui: document.getElementById('fact-ui'),
+  config: document.getElementById('config'),
+  configTitle: document.getElementById('config-title'),
+  configHint: document.getElementById('config-hint'),
+  nodePath: document.getElementById('node-path'),
+  nodeStatus: document.getElementById('node-status'),
+  pnpmPath: document.getElementById('pnpm-path'),
+  pnpmStatus: document.getElementById('pnpm-status'),
+  configSave: document.getElementById('config-save'),
 };
 
 /** Phases where the runtime is up but not usable yet. */
@@ -111,6 +119,8 @@ function render() {
   el.problems.hidden = problems.length === 0;
   el.problems.textContent = problems.join('\n');
 
+  renderConfig();
+
   const runtime = state.runtime ?? {};
   el.active.textContent = runtime.active ?? '—';
   el.dsh.textContent = runtime.active_dsh_version ?? '—';
@@ -156,6 +166,102 @@ function render() {
   // diagnosed from a screenshot of stale UI again.
   el.ui.textContent = state.uiVersion ?? '—';
 }
+
+/* The Node / pnpm form.
+ *
+ * Only the shell page can render this: a `slim` build has no Node until the form
+ * is filled in, so the runtime that would normally draw a settings page does not
+ * exist yet. Nothing here validates on its own — every verdict comes from the
+ * host, so there is exactly one definition of "this path works".
+ */
+
+let configTouched = false;
+
+/** Text for one validated path, as a status line. */
+function checkText(label, check) {
+  if (check === undefined || check === null) return '';
+  if (check.error) return `${check.path}: ${check.error}`;
+  const version = check.version ? ` ${check.version}` : '';
+  const warnings = check.warnings ?? [];
+  return [`${label}${version} works`, ...warnings].join('\n');
+}
+
+function setStatus(element, text, kind) {
+  element.textContent = text;
+  element.dataset.kind = kind ?? '';
+  element.hidden = text === '';
+}
+
+/**
+ * Show the form whenever the shell cannot launch a runtime, or when something the
+ * user saved does not work. "Nothing configured yet" is not an error: it is the
+ * prompt (docs/spec-slim-runtime-config.md §1).
+ */
+function renderConfig() {
+  const settings = state.settings ?? {};
+  const needsConfig = !state.configured || Boolean(state.nodeProblem) || Boolean(settings.problem);
+
+  el.config.hidden = !needsConfig;
+  if (!needsConfig) return;
+
+  el.configTitle.textContent = state.configured ? 'Runtime problem' : 'A Node runtime is required';
+
+  const hint = [];
+  hint.push(
+    state.configured
+      ? `Currently using ${state.node} (${state.nodeSource ?? 'unknown source'}).`
+      : 'This build carries no Node. Name the Node this app should run the harness with.',
+  );
+  if (settings.problem) hint.push(settings.problem);
+  if (state.nodeProblem) hint.push(state.nodeProblem);
+  el.configHint.textContent = hint.join('\n');
+
+  // Never fight the user's typing: the payload also arrives on every status
+  // event, including ones unrelated to this form.
+  if (!configTouched) {
+    el.nodePath.value = settings.node ?? '';
+    el.pnpmPath.value = settings.pnpm ?? '';
+    if (el.nodeStatus.textContent === '') {
+      setStatus(
+        el.nodeStatus,
+        state.configured ? `${state.node} works` : '',
+        state.configured ? 'ok' : undefined,
+      );
+    }
+    if (settings.pnpm === null || settings.pnpm === undefined) {
+      setStatus(
+        el.pnpmStatus,
+        state.bundledPnpm ? 'Using the pnpm this app carries.' : '',
+        undefined,
+      );
+    }
+    if (!state.configured && !settings.pnpm && !state.bundledPnpm) {
+      setStatus(el.pnpmStatus, 'Plugins stay unavailable until a pnpm is named.', 'warn');
+    }
+  }
+}
+
+el.configSave.addEventListener('click', async () => {
+  const node = el.nodePath.value.trim();
+  const pnpm = el.pnpmPath.value.trim();
+  setStatus(el.nodeStatus, 'Checking…', undefined);
+  setStatus(el.pnpmStatus, '', undefined);
+  try {
+    const report = await invoke('save_settings', { node, pnpm: pnpm === '' ? null : pnpm });
+    setStatus(
+      el.nodeStatus,
+      checkText('Node', report.node) || 'Not saved: the Node path is required.',
+      report.node?.ok ? 'ok' : 'err',
+    );
+    if (report.pnpm) {
+      setStatus(el.pnpmStatus, checkText('pnpm', report.pnpm), report.pnpm.ok ? 'ok' : 'err');
+    }
+    configTouched = false;
+  } catch (error) {
+    setStatus(el.nodeStatus, String(error), 'err');
+  }
+  await refresh();
+});
 
 async function refresh() {
   try {
@@ -208,7 +314,17 @@ el.reload.addEventListener('click', async () => {
   await refresh();
 });
 
-await listen('dsh://status', () => {
+await listen('dsh://status', (event) => {
+  // Starting a preset without a Node is guidance, not a failure: the host says so
+  // with this phase instead of pushing an error into the problems list
+  // (docs/spec-slim-runtime-config.md §3.3).
+  if (event?.payload?.phase === 'unconfigured') {
+    el.config.hidden = false;
+    el.configTitle.textContent = 'A Node runtime is required';
+    el.configHint.textContent = event.payload.error ?? 'Name the Node this app should use.';
+    el.nodePath.focus();
+    return;
+  }
   void refresh();
 });
 

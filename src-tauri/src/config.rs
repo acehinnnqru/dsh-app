@@ -9,19 +9,19 @@
 use std::path::{Path, PathBuf};
 
 use crate::runtime_store::RuntimeStore;
+use crate::settings::Settings;
 
 use serde::{Deserialize, Serialize};
 
 /// A resolved runtime layout on disk.
+///
+/// Deliberately no longer carries a Node: resolution needs the settings file
+/// (`slim` carries no Node at all), so it is done explicitly by the callers that
+/// know which context they are in — global startup, or one preset.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     /// Directory holding `runtime.json`, `package.json`, `node_modules/`.
     pub dir: PathBuf,
-    /// The Node executable to run the closure with.
-    pub node: PathBuf,
-    /// Where that executable came from; carried so diagnostics can say which
-    /// runtime is in use instead of only its path.
-    pub node_source: NodeSource,
 }
 
 /// The launch plan the shell needs: where state lives and which runtime to use.
@@ -31,6 +31,9 @@ pub struct AppConfig {
     pub home: PathBuf,
     /// The selected runtime.
     pub runtime: RuntimeConfig,
+    /// Problems found while loading settings, surfaced in the UI. A corrupt
+    /// settings file never stops the shell: it means "unconfigured".
+    pub settings_problems: Vec<String>,
 }
 
 /// `runtime.json` as written by `scripts/prepare-runtime.mjs`.
@@ -119,8 +122,9 @@ pub fn resolve_home(root: &Path) -> PathBuf {
 /// only until the first seed has been installed — which keeps a fresh checkout
 /// working with nothing but `pnpm runtime:prepare`.
 ///
-/// Node resolution follows D2's precedence: `DSH_APP_NODE`, then the bundled
-/// official archive, then `PATH`.
+/// Node resolution is **not** done here: only a preset knows its own `node`
+/// override, and a `slim` build may legitimately have none at all
+/// (spec §2.1).
 pub fn load(home: &Path, store: &RuntimeStore) -> Result<AppConfig, String> {
     let root = repo_root();
     let dir = match store.active_dir() {
@@ -128,15 +132,13 @@ pub fn load(home: &Path, store: &RuntimeStore) -> Result<AppConfig, String> {
         None => newest_runtime_dir(&root.join(".dsh-build").join("runtimes"))?,
     };
     RuntimeManifest::load(&dir)?;
-    let resolved = resolve_node_with(None, &root)?;
+    let settings = crate::settings::load(home);
+    let settings_problems = settings.problem.iter().cloned().collect();
 
     Ok(AppConfig {
         home: home.to_path_buf(),
-        runtime: RuntimeConfig {
-            dir,
-            node: resolved.path,
-            node_source: resolved.source,
-        },
+        runtime: RuntimeConfig { dir },
+        settings_problems,
     })
 }
 
@@ -175,6 +177,8 @@ pub enum NodeSource {
     Preset,
     /// `DSH_APP_NODE` named it.
     Environment,
+    /// The settings file named it — what the user typed into the shell's form.
+    Settings,
     /// The copy the app bundle carries.
     Bundled,
     /// Found at a standard installation location.
@@ -187,6 +191,7 @@ impl NodeSource {
         match self {
             NodeSource::Preset => "preset",
             NodeSource::Environment => "DSH_APP_NODE",
+            NodeSource::Settings => "settings",
             NodeSource::Bundled => "bundled",
             NodeSource::Installed => "installed",
         }
@@ -200,115 +205,231 @@ pub struct ResolvedNode {
     pub source: NodeSource,
 }
 
+/// The outcome of Node resolution.
+///
+/// `Unconfigured` is a **state, not an error** (spec §1): a `slim` build with no
+/// Node named anywhere is waiting for the user to fill in the form, and must not
+/// show an error before they have had the chance.
+#[derive(Debug, Clone)]
+pub enum NodeResolution {
+    Configured(ResolvedNode),
+    Unconfigured,
+}
+
+impl NodeResolution {
+    /// The resolved Node, when there is one.
+    pub fn node(&self) -> Option<&ResolvedNode> {
+        match self {
+            NodeResolution::Configured(node) => Some(node),
+            NodeResolution::Unconfigured => None,
+        }
+    }
+}
+
+/// Where auto-discovery stands for this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeOptions {
+    /// Release behaviour: never guess (spec §2).
+    Explicit,
+    /// Development only: also try standard locations and `PATH`, so `cargo run`
+    /// works in a devshell without ceremony.
+    ///
+    /// Consequence to remember when testing: a dev build almost always finds a
+    /// Node, so the "unconfigured" flow can only be exercised by a release build.
+    Discover,
+}
+
+impl NodeOptions {
+    /// What this build should do.
+    pub fn for_current_build() -> Self {
+        if cfg!(debug_assertions) {
+            NodeOptions::Discover
+        } else {
+            NodeOptions::Explicit
+        }
+    }
+}
+
+/// Everything resolution needs besides the explicit per-preset value.
+pub struct NodeContext<'a> {
+    pub settings: &'a Settings,
+    pub options: NodeOptions,
+    /// A development checkout's staged Node installs, searched at level 4
+    /// alongside the bundle's copy. Empty for a packaged app.
+    pub staged: &'a [PathBuf],
+}
+
 /// Resolve the Node executable for one runtime directory.
 ///
-/// Precedence, highest first:
+/// Precedence, highest first (spec §2):
 ///
-/// 1. the preset's `node` — an explicit choice for that preset;
-/// 2. `DSH_APP_NODE` — the same choice made for a whole session;
-/// 3. the Node the app bundle carries, when it carries one;
-/// 4. *development builds only*: a standard installation location, then `PATH`.
+/// 1. the preset's `node` — the most specific scope;
+/// 2. `DSH_APP_NODE` — one session;
+/// 3. `settings.json` — this machine;
+/// 4. the Node the app bundle carries, when it carries one;
+/// 5. *development builds only*: a standard installation location, then `PATH`.
 ///
-/// Level 3 is what makes the `bundled` variant need no configuration. The `slim`
-/// variant has no level 3, so it needs level 1 or 2 and otherwise refuses to
-/// start with an actionable message — "use your own Node" is then a deliberate
-/// act rather than whatever happened to be on `PATH`.
+/// "More specific scope wins" is what makes a per-preset override usable at all:
+/// if the settings file outranked the preset, the override could never take
+/// effect once the form had been filled in.
 ///
-/// Level 4 exists only so `cargo run` works from a devshell; a release build
-/// never guesses, because a macOS app started from Finder sees
-/// `/usr/bin:/bin:/usr/sbin:/sbin` and not the user's shell environment.
-pub fn resolve_node_with(explicit: Option<&str>, root: &Path) -> Result<ResolvedNode, String> {
-    if let Some(chosen) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+/// A value that was named but is unusable (missing, not executable) is an error
+/// rather than a reason to fall through: silently launching a different Node than
+/// the one that was asked for is worse than saying so.
+pub fn resolve_node(
+    explicit: Option<&str>,
+    context: &NodeContext<'_>,
+) -> Result<NodeResolution, String> {
+    // 1. The preset's own choice.
+    if let Some(chosen) = non_empty(explicit) {
         let path = PathBuf::from(chosen);
-        if path.is_file() {
-            return Ok(ResolvedNode { path, source: NodeSource::Preset });
-        }
-        return Err(format!(
-            "the preset's node is not a file: {}\n\
-             fix the preset's `node` setting, or remove it to use the app's own runtime",
-            path.display()
-        ));
+        return match usable(&path) {
+            true => Ok(NodeResolution::Configured(ResolvedNode {
+                path,
+                source: NodeSource::Preset,
+            })),
+            false => Err(format!(
+                "the preset's node is not an executable file: {}\n\
+                 fix the preset's `node` setting, or remove it to use the app's own runtime",
+                path.display()
+            )),
+        };
     }
 
+    // 2. The session.
     if let Ok(from_env) = std::env::var("DSH_APP_NODE") {
-        if !from_env.trim().is_empty() {
-            let path = PathBuf::from(from_env.trim());
-            if path.is_file() {
-                return Ok(ResolvedNode { path, source: NodeSource::Environment });
-            }
-            return Err(format!("DSH_APP_NODE is not a file: {}", path.display()));
+        if let Some(chosen) = non_empty(Some(&from_env)) {
+            let path = PathBuf::from(chosen);
+            return match usable(&path) {
+                true => Ok(NodeResolution::Configured(ResolvedNode {
+                    path,
+                    source: NodeSource::Environment,
+                })),
+                false => Err(format!(
+                    "DSH_APP_NODE is not an executable file: {}",
+                    path.display()
+                )),
+            };
         }
     }
 
-    // The bundled official archive, for the `bundled` variant and for a checkout
-    // that has run `pnpm runtime:prepare`. It sits in Resources rather than MacOS
-    // because `Contents/MacOS` is reserved for the shell executable (doc A.3).
-    if let Ok(exe) = std::env::current_exe() {
-        let bundled = exe
-            .parent()
-            .map(|dir| dir.join("../Resources/node/bin/node"))
-            .unwrap_or_default();
-        if bundled.is_file() {
-            return Ok(ResolvedNode { path: bundled, source: NodeSource::Bundled });
+    // 3. What the user typed into the shell's form.
+    if let Some(chosen) = non_empty(context.settings.node.as_deref()) {
+        let path = PathBuf::from(chosen);
+        return match usable(&path) {
+            true => Ok(NodeResolution::Configured(ResolvedNode {
+                path,
+                source: NodeSource::Settings,
+            })),
+            false => Err(format!(
+                "settings.json names a node that is not an executable file: {}\n\
+                 re-enter it in the shell's Node path field",
+                path.display()
+            )),
+        };
+    }
+
+    // 4. The copy the app carries — this is what makes `bundled` zero-config —
+    // then a development checkout's staged install.
+    for candidate in bundled_node_candidates().iter().chain(context.staged) {
+        if usable(candidate) {
+            return Ok(NodeResolution::Configured(ResolvedNode {
+                path: candidate.clone(),
+                source: NodeSource::Bundled,
+            }));
         }
     }
+
+    // 5. Development conveniences, never present in a release build: a macOS app
+    // started from Finder does not inherit the login shell's environment, so
+    // "look on PATH" would choose from an environment the user never set up.
+    if context.options == NodeOptions::Discover {
+        for candidate in installed_node_candidates() {
+            if usable(&candidate) {
+                return Ok(NodeResolution::Configured(ResolvedNode {
+                    path: candidate,
+                    source: NodeSource::Installed,
+                }));
+            }
+        }
+    }
+
+    Ok(NodeResolution::Unconfigured)
+}
+
+/// The message shown when nothing is configured. Phrased as guidance, because
+/// that is what it is: the form is the answer, not an error dialog.
+pub fn unconfigured_message() -> String {
+    "no Node runtime is configured.\n\
+     \n\
+     A `slim` build carries none: name the Node this app should use in the shell's\n\
+     Node path field, or set DSH_APP_NODE=/path/to/node for one session.\n\
+     \n\
+     Use a Node from nodejs.org: a distribution-repackaged build can load the\n\
+     require-builtin addon and then refuse every id, which breaks live reload."
+        .to_owned()
+}
+
+/// The Node the running executable's bundle carries, if any.
+fn bundled_node_candidates() -> Vec<PathBuf> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let Some(dir) = exe.parent() else {
+        return Vec::new();
+    };
+    // It sits in Resources rather than MacOS because `Contents/MacOS` is reserved
+    // for the shell executable (design doc A.3).
+    vec![dir.join("../Resources/node/bin/node")]
+}
+
+/// Node installations staged for a development checkout.
+pub fn staged_candidates(root: &Path) -> Vec<PathBuf> {
     let staged = root.join(".dsh-build").join("node");
-    let mut staged_candidates = Vec::new();
+    let mut candidates = Vec::new();
     if let Some(version) = bundled_node_version(root) {
-        staged_candidates.push(staged.join(&version).join("bin").join("node"));
+        candidates.push(staged.join(&version).join("bin").join("node"));
     }
     if let Ok(entries) = std::fs::read_dir(&staged) {
         for entry in entries.flatten() {
             let candidate = entry.path().join("bin").join("node");
-            if !staged_candidates.contains(&candidate) {
-                staged_candidates.push(candidate);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
         }
     }
-    for candidate in staged_candidates {
-        if candidate.is_file() {
-            return Ok(ResolvedNode { path: candidate, source: NodeSource::Bundled });
-        }
-    }
+    candidates
+}
 
-    // Nothing else, for a release build. Auto-discovery is deliberately absent:
-    // a macOS app started from Finder does not inherit the login shell's
-    // environment, so "look on PATH" would choose from a minimal environment the
-    // user never set up, and a wrong choice is worse than a clear refusal.
-    //
-    // A development build keeps the conveniences, because there the developer
-    // did set the environment and `cargo run` should work without ceremony.
-    if cfg!(debug_assertions) {
-        for candidate in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
-            let path = PathBuf::from(candidate);
-            if path.is_file() {
-                return Ok(ResolvedNode { path, source: NodeSource::Installed });
-            }
-        }
-        if let Ok(path) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path) {
-                let candidate = dir.join("node");
-                if candidate.is_file() {
-                    return Ok(ResolvedNode { path: candidate, source: NodeSource::Installed });
-                }
-            }
-        }
+/// Standard locations and `PATH`, for development builds only.
+fn installed_node_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Ok(path) = std::env::var("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("node")));
     }
+    candidates
+}
 
-    Err(
-        "this build carries no Node runtime, and none was named.\n\
-         \n\
-         Name one of the two ways available:\n\
-         \n\
-         * per preset:  add `node = \"/opt/homebrew/bin/node\"` to the preset file\n\
-         * per session: export DSH_APP_NODE=/path/to/node\n\
-         \n\
-         Or use the `bundled` build, which carries Node and needs no configuration.\n\
-         \n\
-         Use a Node from nodejs.org: a distribution-repackaged build can load the\n\
-         require-builtin addon and then refuse every id, which breaks live reload."
-            .to_owned(),
-    )
+/// A non-empty, trimmed value.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Whether this path can actually be launched.
+///
+/// `is_file()` alone is not enough: a plain file without the execute bit, or a
+/// non-Node binary, would pass it and fail much later with a confusing message
+/// (spec §3.1).
+pub fn usable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 /// The Node version the shell bundles, read from the root manifest's pin.
@@ -337,65 +458,126 @@ fn newest_runtime_dir(runtimes: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("no prepared runtime under {}\nrun `pnpm runtime:prepare` first", runtimes.display()))
 }
 
-/// Resolve the Node executable per D2's precedence.
-fn resolve_node(root: &Path, manifest: &RuntimeManifest) -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("DSH_APP_NODE") {
-        if !explicit.is_empty() {
-            let path = PathBuf::from(explicit);
-            if path.is_file() {
-                return Ok(path);
-            }
-            return Err(format!("DSH_APP_NODE is not a file: {}", path.display()));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An executable scratch file, so `usable` has something real to look at.
+    fn executable(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the file is writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod works");
+        path
     }
 
-    // The bundled official archive: an explicit version first (the pin in
-    // package.json), then whatever else has been staged. Official builds are the
-    // only ones `node-addon-require-builtin` supports, so this level outranks PATH.
-    let staged = root.join(".dsh-build").join("node");
-    let mut candidates = Vec::new();
-    if let Some(version) = bundled_node_version(root) {
-        candidates.push(staged.join(&version).join("bin").join("node"));
-    }
-    if let Ok(entries) = std::fs::read_dir(&staged) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("bin").join("node");
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
+    fn scratch(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dsh-app-config-{name}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        dir
     }
 
-    // The Node the bundle carries, for the `bundled` variant. It sits in
-    // Resources rather than MacOS because `Contents/MacOS` is reserved for the
-    // shell executable itself (design doc A.3/A.4).
-    if let Ok(exe) = std::env::current_exe() {
-        let bundled = exe
-            .parent()
-            .map(|dir| dir.join("../Resources/node/bin/node"))
-            .unwrap_or_default();
-        if bundled.is_file() {
-            return Ok(bundled);
-        }
+    #[test]
+    fn nothing_configured_is_a_state_and_not_an_error() {
+        let settings = Settings::default();
+        let empty = scratch("unconfigured");
+        let context = NodeContext {
+            settings: &settings,
+            // Release behaviour: no discovery, so the outcome cannot depend on the
+            // machine running the test.
+            options: NodeOptions::Explicit,
+            staged: &[],
+        };
+        let resolution = resolve_node(None, &context).expect("unconfigured is not a failure");
+        assert!(resolution.node().is_none());
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
-    // Fall back to PATH so a plain `cargo run` works in the devshell.
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("node");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+    #[test]
+    fn a_staged_checkout_node_satisfies_level_four() {
+        let dir = scratch("staged");
+        let node = executable(&dir, "node");
+        let settings = Settings::default();
+        let staged = vec![node.clone()];
+        let context = NodeContext {
+            settings: &settings,
+            options: NodeOptions::Explicit,
+            staged: &staged,
+        };
+        let resolved = resolve_node(None, &context).expect("a staged node resolves").node().cloned();
+        assert_eq!(resolved.map(|node| node.path), Some(node));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    Err(format!(
-        "no Node executable found for runtime {} ({}); set DSH_APP_NODE or run `pnpm runtime:prepare`",
-        manifest.dsh_version, manifest.node.requirement
-    ))
+    #[test]
+    fn a_configured_node_outranks_the_bundle() {
+        let dir = scratch("settings");
+        let node = executable(&dir, "node");
+        let settings = Settings {
+            schema: None,
+            node: Some(node.display().to_string()),
+            pnpm: None,
+        };
+        let context = NodeContext {
+            settings: &settings,
+            options: NodeOptions::Explicit,
+            staged: &[],
+        };
+        let resolved = resolve_node(None, &context).expect("a configured node resolves");
+        let resolved = resolved.node().expect("it is configured");
+        assert_eq!(resolved.path, node);
+        assert_eq!(resolved.source, NodeSource::Settings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_named_but_unusable_path_is_an_error_not_a_fallthrough() {
+        let dir = scratch("unusable");
+        // Exists, but nothing may execute it: silently using a different Node
+        // would be worse than saying so.
+        let path = dir.join("node");
+        std::fs::write(&path, "not executable").expect("the file is writable");
+        let settings = Settings {
+            schema: None,
+            node: Some(path.display().to_string()),
+            pnpm: None,
+        };
+        let context = NodeContext {
+            settings: &settings,
+            options: NodeOptions::Explicit,
+            staged: &[],
+        };
+        let error = resolve_node(None, &context).expect_err("a non-executable path is refused");
+        assert!(error.contains("not an executable file"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_per_preset_choice_outranks_everything_else() {
+        let dir = scratch("preset");
+        let node = executable(&dir, "node");
+        let settings = Settings {
+            schema: None,
+            node: Some("/nonexistent/from-settings".to_owned()),
+            pnpm: None,
+        };
+        let context = NodeContext {
+            settings: &settings,
+            options: NodeOptions::Explicit,
+            staged: &[],
+        };
+        let resolved = resolve_node(Some(&node.display().to_string()), &context)
+            .expect("the preset's node resolves")
+            .node()
+            .cloned()
+            .expect("it is configured");
+        assert_eq!(resolved.source, NodeSource::Preset);
+        assert_eq!(resolved.path, node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

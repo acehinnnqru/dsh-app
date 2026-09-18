@@ -19,6 +19,36 @@
       <section id="fatal" class="problems" hidden></section>
       <section id="problems" class="problems" hidden></section>
 
+      <!-- Rendered by the shell page, not by the runtime: a `slim` build has no
+           Node until this is filled in, so the runtime cannot be the one asking. -->
+      <section id="config" class="card" hidden>
+        <h2 id="config-title">Runtime</h2>
+        <p id="config-hint" class="config-hint"></p>
+
+        <label class="field">
+          <span class="field-label">Node path <em>required</em></span>
+          <input id="node-path" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="/opt/homebrew/bin/node" />
+          <span id="node-status" class="field-status"></span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">pnpm path <em>optional</em></span>
+          <input id="pnpm-path" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="/opt/homebrew/bin/pnpm" />
+          <span id="pnpm-status" class="field-status"></span>
+        </label>
+
+        <div class="config-actions">
+          <button id="config-save" type="button">Validate and save</button>
+          <span class="config-note">
+            Use a Node from nodejs.org: a distribution-repackaged build can load the
+            <code>require-builtin</code> addon and then refuse every id, which breaks
+            <code>patchReload: live</code>.
+          </span>
+        </div>
+      </section>
+
       <ul id="presets" class="presets"></ul>
 
       <p id="empty" class="empty" hidden>

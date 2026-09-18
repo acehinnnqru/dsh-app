@@ -17,11 +17,12 @@ mod preset_store;
 mod profile;
 mod profile_template;
 mod runtime_store;
+mod settings;
 mod smoke;
 mod supervisor;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
@@ -125,6 +126,10 @@ impl ShellState {
 
     /// Everything the UI renders.
     fn snapshot(&self) -> serde_json::Value {
+        // Re-resolved per call on purpose: the Node can change the moment the user
+        // saves the form, and the payload is the only place the page reads it from.
+        let (node, node_problem) = node_report(&self.config.home);
+        let saved = settings::load(&self.config.home);
         serde_json::json!({
             "uiVersion": UI_VERSION,
             "runtime": self.store.status(),
@@ -136,8 +141,18 @@ impl ShellState {
             },
             "home": self.config.home.display().to_string(),
             "runtimeDir": self.config.runtime.dir.display().to_string(),
-            "node": self.config.runtime.node.display().to_string(),
-            "nodeSource": self.config.runtime.node_source.label(),
+            // `configured: false` is guidance, not a failure: the page shows the
+            // Node form instead of an error (spec §3.3).
+            "configured": node.is_some(),
+            "node": node.as_ref().and_then(|value| value["path"].as_str()),
+            "nodeSource": node.as_ref().and_then(|value| value["source"].as_str()),
+            "nodeProblem": node_problem,
+            "settingsFile": settings::settings_path(&self.config.home).display().to_string(),
+            "settings": {
+                "node": saved.settings.node,
+                "pnpm": saved.settings.pnpm,
+                "problem": saved.problem,
+            },
             "bundledPnpm": bundled_pnpm_dir().map(|dir| dir.display().to_string()),
             "presets": self.presets.iter().map(|entry| self.preset_row(entry)).collect::<Vec<_>>(),
             "problems": self.problems,
@@ -172,10 +187,18 @@ fn apply_update(
         if !state.children.is_empty() {
             return Err("stop every running preset before updating the runtime".to_owned());
         }
-        // Resolved here rather than carried from configuration: the preset that
-        // will run afterwards may name its own Node, and this is the one the
-        // smoke test has to use.
-        let node = config::resolve_node_with(None, &config::repo_root())?;
+        // Resolved here rather than carried from configuration: the settings file
+        // is the authority for a global (non-preset) launch, and it may have been
+        // saved a moment ago.
+        let node = match resolve_global_node(&state.config.home).0? {
+            config::NodeResolution::Configured(node) => node,
+            // Updating needs a Node to smoke the new runtime with, so an
+            // unconfigured shell cannot update — the form is the only way forward
+            // (spec §3.4).
+            config::NodeResolution::Unconfigured => {
+                return Err(config::unconfigured_message());
+            }
+        };
         (
             state.store.root().to_path_buf(),
             state.config.home.clone(),
@@ -221,6 +244,404 @@ fn bundled_pnpm_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.join("../Resources/bin");
     dir.is_dir().then_some(dir)
+}
+
+/// Resolve the Node for a caller that is **not** a preset.
+///
+/// Loads settings from disk rather than trusting a cached copy: the user may have
+/// just saved the form, and an update or a seed smoke test needs the new answer
+/// immediately (spec §3.3).
+fn resolve_global_node(home: &Path) -> (Result<config::NodeResolution, String>, Vec<String>) {
+    let report = settings::load(home);
+    let root = config::repo_root();
+    let staged = config::staged_candidates(&root);
+    let context = config::NodeContext {
+        settings: &report.settings,
+        options: config::NodeOptions::for_current_build(),
+        staged: &staged,
+    };
+    let problems = report.problem.iter().cloned().collect();
+    (config::resolve_node(None, &context), problems)
+}
+
+/// What the UI shows about the Node this shell will launch with.
+///
+/// `value: None` means **unconfigured**, which is a state and not a failure; a
+/// message is only present when something the user named is unusable (spec §1).
+fn node_report(home: &Path) -> (Option<serde_json::Value>, Option<String>) {
+    match resolve_global_node(home).0 {
+        Ok(resolution) => {
+            let value = resolution.node().map(|node| {
+                serde_json::json!({
+                    "path": node.path.display().to_string(),
+                    "source": node.source.label(),
+                })
+            });
+            (value, None)
+        }
+        Err(error) => (None, Some(error)),
+    }
+}
+
+/// One path the user typed, as validated.
+#[derive(serde::Serialize)]
+struct PathCheck {
+    /// The path they named.
+    path: String,
+    /// Whether it is missing, a directory, not executable, or not that program.
+    ok: bool,
+    /// `process.versions.node` when the path really is a Node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// Why it was rejected, when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Non-fatal observations, shown but never blocking.
+    warnings: Vec<String>,
+}
+
+/// The verdict on everything the form asked about.
+#[derive(serde::Serialize)]
+struct ValidationReport {
+    ok: bool,
+    node: Option<PathCheck>,
+    pnpm: Option<PathCheck>,
+    /// Whether a Node is available for the runtime to launch with.
+    configured: bool,
+}
+
+impl ValidationReport {
+    /// Validation passes when neither field was rejected. An empty Node field is
+    /// not a rejection here: it is "not filled in yet" (spec §1), and the
+    /// warnings say what that costs.
+    fn ok(&self) -> bool {
+        self.node.as_ref().is_none_or(|check| check.ok)
+            && self.pnpm.as_ref().is_none_or(|check| check.ok)
+    }
+}
+
+/// Check the two paths, without writing anything.
+///
+/// Deliberately does **not** run `node_probe`: the capability probe needs an
+/// installed runtime closure to require the addon from, and in the state that
+/// matters most — a `slim` build with nothing configured — there is none
+/// (spec §3.1). Capability is decided at launch, where the closure exists.
+#[tauri::command]
+fn validate_runtime_paths(
+    state: tauri::State<'_, Mutex<ShellState>>,
+    node: Option<String>,
+    pnpm: Option<String>,
+) -> Result<ValidationReport, String> {
+    let home = lock_state(&state)?.config.home.clone();
+    Ok(validate_paths(&home, node.as_deref(), pnpm.as_deref()))
+}
+
+fn validate_paths(home: &Path, node: Option<&str>, pnpm: Option<&str>) -> ValidationReport {
+    let saved = settings::load(home);
+    let requirement = runtime_node_requirement(home);
+
+    // A blank Node field means "still unconfigured", not "invalid": a saved value
+    // is allowed to stand in, so the form can report the state it would leave
+    // behind rather than complaining about a field the user cleared.
+    let node_check = match node.map(str::trim) {
+        Some("") | None => saved.settings.node.as_deref().map(|saved| check_node(saved, requirement.as_deref())),
+        Some(value) => Some(check_node(value, requirement.as_deref())),
+    };
+    let pnpm_check = match pnpm.map(str::trim) {
+        Some("") | None => saved.settings.pnpm.as_deref().map(|saved| check_pnpm(saved)),
+        Some(value) => Some(check_pnpm(value)),
+    };
+
+    // With an invalid Node saved, resolution errors; with none saved, it is
+    // simply unconfigured. Both are "not launchable", reported the same way.
+    let (resolution, _) = resolve_global_node(home);
+    let report = ValidationReport {
+        ok: false,
+        node: node_check,
+        pnpm: pnpm_check,
+        configured: resolution
+            .as_ref()
+            .map(|resolution| resolution.node().is_some())
+            .unwrap_or(false),
+    };
+    ValidationReport { ok: report.ok(), ..report }
+}
+
+/// Save the form, refusing to store a path that does not work.
+#[tauri::command]
+fn save_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<ShellState>>,
+    node: String,
+    pnpm: Option<String>,
+) -> Result<ValidationReport, String> {
+    let home = lock_state(&state)?.config.home.clone();
+    let report = validate_paths(&home, Some(&node), pnpm.as_deref());
+    if !report.ok {
+        return Ok(report);
+    }
+    settings::save(&home, &node, pnpm.as_deref())?;
+    // Nothing else learns about the new Node on its own: the seed runtime was
+    // skipped while nothing was configured, so try to activate it now.
+    if report.configured {
+        let app = app.clone();
+        std::thread::spawn(move || activate_seed_if_needed(app));
+    }
+    Ok(report)
+}
+
+/// The `node` requirement the active runtime declares, when it can be read.
+///
+/// Read from the installed runtime's manifest rather than a constant compiled
+/// into the shell: the runtime updates independently of the shell, and its
+/// requirement is the one that matters.
+fn runtime_node_requirement(home: &Path) -> Option<String> {
+    let store = RuntimeStore::new(home);
+    let dir = store.active_dir()?;
+    config::RuntimeManifest::load(&dir)
+        .ok()
+        .map(|manifest| manifest.node.requirement)
+}
+
+/// Check one Node path: exists, executable, and actually a Node.
+fn check_node(value: &str, requirement: Option<&str>) -> PathCheck {
+    let path = PathBuf::from(value.trim());
+    let mut warnings = Vec::new();
+    let mut check = PathCheck {
+        path: path.display().to_string(),
+        ok: false,
+        version: None,
+        error: None,
+        warnings: Vec::new(),
+    };
+    if let Err(error) = check_executable(&path) {
+        check.error = Some(error);
+        return check;
+    }
+
+    match run_version(&path) {
+        Ok(text) => {
+            check.ok = true;
+            check.version = Some(text.clone());
+            // The range is a warning, never a block: a `patchReload: startup`
+            // profile works on Node versions the harness does not test against,
+            // and refusing them would block a working setup (spec §5, Q5).
+            if let Some(requirement) = requirement {
+                if !satisfies(&text, requirement) {
+                    warnings.push(format!(
+                        "Node {text} is outside the runtime's requirement {requirement}; \
+                         profiles with patchReload = \"live\" may fail"
+                    ));
+                }
+            }
+        }
+        // A path that exists and is executable but is not Node at all: reject,
+        // because everything downstream would fail confusingly.
+        Err(error) => check.error = Some(error),
+    }
+    check.warnings = warnings;
+    check
+}
+
+/// Check one pnpm path. pnpm is optional and only affects plugins, so a rejected
+/// pnpm never blocks saving a working Node (spec §5, Q2).
+fn check_pnpm(value: &str) -> PathCheck {
+    let path = PathBuf::from(value.trim());
+    let mut check = PathCheck {
+        path: path.display().to_string(),
+        ok: false,
+        version: None,
+        error: None,
+        warnings: Vec::new(),
+    };
+    match check_executable(&path).and_then(|()| run_version(&path)) {
+        Ok(version) => {
+            check.ok = true;
+            check.version = Some(version);
+        }
+        Err(error) => check.error = Some(error),
+    }
+    check
+}
+
+/// Whether the path is a file the current user may execute.
+fn check_executable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("{} does not exist", path.display()),
+        _ => format!("cannot read {}: {error}", path.display()),
+    })?;
+    if metadata.is_dir() {
+        return Err(format!("{} is a directory", path.display()));
+    }
+    if !config::usable(path) {
+        return Err(format!("{} is not executable", path.display()));
+    }
+    Ok(())
+}
+
+/// Run `<path> --version`, returning the version it prints.
+///
+/// Used as the "is this really Node, and does it run at all" check. A binary that
+/// cannot even print its version is not one the shell can launch a runtime with.
+fn run_version(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", path.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let detail = stderr
+            .lines()
+            .chain(stdout.lines())
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("it printed nothing");
+        return Err(format!("{} --version failed: {detail}", path.display()));
+    }
+    let version = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| format!("{} --version printed nothing", path.display()))?;
+    Ok(version.trim_start_matches('v').to_owned())
+}
+
+/// Whether a Node version satisfies a `^x.y.z || >=a.b.c` style requirement.
+///
+/// Only the two shapes the runtime actually publishes are understood; anything
+/// else answers "satisfied", because an unparsed requirement must never turn into
+/// a warning the user cannot act on.
+fn satisfies(version: &str, requirement: &str) -> bool {
+    let Some(found) = parse_version(version) else {
+        return true;
+    };
+    // `any_parsed` distinguishes "nothing matched" from "nothing was
+    // understandable": only the former is a real mismatch. A requirement written
+    // in a syntax this build does not know must not produce a warning the user
+    // can do nothing about.
+    let mut any_parsed = false;
+    for part in requirement.split("||") {
+        let part = part.trim();
+        let (operator, rest) = if let Some(rest) = part.strip_prefix(">=") {
+            (">=", rest)
+        } else if let Some(rest) = part.strip_prefix('^') {
+            ("^", rest)
+        } else if let Some(rest) = part.strip_prefix('>') {
+            (">", rest)
+        } else {
+            ("=", part)
+        };
+        let Some(wanted) = parse_version(rest.trim()) else {
+            continue;
+        };
+        any_parsed = true;
+        let satisfied = match operator {
+            ">=" => found >= wanted,
+            ">" => found > wanted,
+            // Caret: same major, and at least the named minor and patch.
+            "^" => found.0 == wanted.0 && found >= wanted,
+            _ => found == wanted,
+        };
+        if satisfied {
+            return true;
+        }
+    }
+    !any_parsed
+}
+
+/// Parse the numeric prefix of a version.
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = text.trim().trim_start_matches('v').split(['.', '-', '+']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Install the seed runtime and smoke it, once a Node is available.
+///
+/// Called after the form is saved: while nothing was configured the startup path
+/// skips the seed entirely, so this is the only thing that turns a saved Node into
+/// a usable runtime (spec §3.2).
+fn activate_seed_if_needed(app: tauri::AppHandle) {
+    let (home, store, staged) = {
+        let handle = app.state::<Mutex<ShellState>>();
+        let Ok(state) = handle.lock() else {
+            return;
+        };
+        if state.store.active_dir().is_some() {
+            return;
+        }
+        (
+            state.config.home.clone(),
+            RuntimeStore::new(&state.config.home),
+            config::staged_candidates(&config::repo_root()),
+        )
+    };
+    let Some(seed) = config::seed_runtime_dir() else {
+        return;
+    };
+    let Some(id) = seed.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+        return;
+    };
+    if let Err(error) = store.install(&id, &seed) {
+        record_problem(&app, error);
+        return;
+    }
+    let report = settings::load(&home);
+    let context = config::NodeContext {
+        settings: &report.settings,
+        options: config::NodeOptions::for_current_build(),
+        staged: &staged,
+    };
+    let (node, message) = match config::resolve_node(None, &context) {
+        Ok(config::NodeResolution::Configured(node)) => (node, None),
+        Ok(config::NodeResolution::Unconfigured) => (config::ResolvedNode {
+            path: PathBuf::new(),
+            source: config::NodeSource::Settings,
+        }, Some(config::unconfigured_message())),
+        Err(error) => (
+            config::ResolvedNode {
+                path: PathBuf::new(),
+                source: config::NodeSource::Settings,
+            },
+            Some(error),
+        ),
+    };
+    if let Some(message) = message {
+        record_problem(&app, message);
+        return;
+    }
+    let dir = store.root().join(&id);
+    let report = smoke::smoke(&dir, node.clone(), &smoke::smoke_home(&home), Vec::new());
+    if !report.ok {
+        record_problem(
+            &app,
+            format!(
+                "the seeded runtime {id} failed its smoke test: {}",
+                report.detail.unwrap_or_else(|| "unknown reason".to_owned())
+            ),
+        );
+        return;
+    }
+    if let Err(error) = store.activate(&id) {
+        record_problem(&app, error);
+        return;
+    }
+    let _ = app.emit("dsh://status", serde_json::json!({ "phase": "runtime-ready" }));
+}
+
+/// Record a problem and let the UI refresh.
+fn record_problem(app: &tauri::AppHandle, message: String) {
+    eprintln!("[dsh-app] {message}");
+    if let Ok(mut state) = app.state::<Mutex<ShellState>>().lock() {
+        state.problems.push(message.clone());
+    }
+    let _ = app.emit(
+        "dsh://status",
+        serde_json::json!({ "phase": "failed", "error": message }),
+    );
 }
 
 /// Sample presets staged by `build.rs`, seeded into the home on first run.
@@ -350,13 +771,7 @@ fn reload_presets(state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), Stri
 
 /// Record a startup failure and notify the UI.
 fn fail_preset(app: &tauri::AppHandle, message: &str) {
-    if let Ok(mut state) = app.state::<Mutex<ShellState>>().lock() {
-        state.problems.push(message.to_owned());
-    }
-    let _ = app.emit(
-        "dsh://status",
-        serde_json::json!({ "phase": "failed", "error": message }),
-    );
+    record_problem(app, message.to_owned());
 }
 
 /// Spawn the launcher for `preset_id` and, once ready, open its window.
@@ -366,7 +781,7 @@ fn fail_preset(app: &tauri::AppHandle, message: &str) {
 fn start_preset(app: tauri::AppHandle, preset_id: String) {
     std::thread::spawn(move || {
         let handle = app.state::<Mutex<ShellState>>();
-        let (config, preset, patch_files, node, node_args, capability) = {
+        let (config, preset, patch_files, node, pnpm, node_args, capability) = {
             let Ok(state) = handle.lock() else {
                 eprintln!("[dsh-app] shell state is unavailable");
                 return;
@@ -379,13 +794,34 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
                 return;
             };
 
-            // The preset's `node` is the user's explicit choice for this preset.
-            // Passing it here is what makes the documented field take effect —
-            // without it, a `slim` build could never be configured at all.
-            let resolved = match config::resolve_node_with(entry.preset.node.as_deref(), &config::repo_root()) {
-                Ok(resolved) => resolved,
+            // Level 2 of the resolution chain: the preset's `node`, which outranks
+            // the settings file because it is the more specific scope. Levels 3
+            // and 4 come from the settings file and the bundle.
+            let saved = settings::load(&state.config.home);
+            let staged = config::staged_candidates(&config::repo_root());
+            let context = config::NodeContext {
+                settings: &saved.settings,
+                options: config::NodeOptions::for_current_build(),
+                staged: &staged,
+            };
+            let resolved = match config::resolve_node(entry.preset.node.as_deref(), &context) {
+                Ok(config::NodeResolution::Configured(resolved)) => resolved,
+                // Not an error: the shell is waiting for the user to name a Node.
+                // Say where to do it instead of showing a failure (spec §3.2).
+                Ok(config::NodeResolution::Unconfigured) => {
+                    drop(state);
+                    let _ = app.emit(
+                        "dsh://status",
+                        serde_json::json!({
+                            "presetId": preset_id,
+                            "phase": "unconfigured",
+                            "field": "node",
+                            "error": config::unconfigured_message(),
+                        }),
+                    );
+                    return;
+                }
                 Err(error) => {
-                    eprintln!("[dsh-app] {error}");
                     drop(state);
                     fail_preset(&app, &error);
                     return;
@@ -420,6 +856,9 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
                 entry.preset.clone(),
                 entry.patch_files.clone(),
                 resolved,
+                // The user's pnpm when they named one; `dsh plugin` finds it on the
+                // child's PATH, and otherwise falls back to the bundle's copy (§4).
+                saved.settings.pnpm_path(),
                 node_args,
                 capability,
             )
@@ -430,7 +869,7 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
         if preset.needs_internals() && !capability.internals_available() && capability.version == "unknown" {
             let message = format!(
                 "preset {preset_id} needs internals access but {} could not be probed: {}",
-                config.runtime.node.display(),
+                node.path.display(),
                 capability.detail.unwrap_or_else(|| "unknown reason".to_owned())
             );
             fail_preset(&app, &message);
@@ -455,10 +894,15 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
 
         let child = SupervisedChild::start(
             preset,
-            node.clone(),
-            manifest.entry_path(&config.runtime.dir),
-            config.runtime.dir.clone(),
-            config.home.clone(),
+            supervisor::Launch {
+                node: node.clone(),
+                entry: manifest.entry_path(&config.runtime.dir),
+                cwd: config.runtime.dir.clone(),
+                home: config.home.clone(),
+                // A bare `pnpm` when the user named none: PATH still has the
+                // bundle's `bin/` first, so this resolves to the shipped copy.
+                pnpm: pnpm.unwrap_or_else(|| PathBuf::from("pnpm")),
+            },
             patch_files,
             node_args,
         );
@@ -563,7 +1007,7 @@ fn install_page_probe(app: &tauri::AppHandle) {
 /// `--rollback` is a recovery path, not a convenience: if a bad runtime keeps
 /// the shell from coming up usefully, this is how the user gets back to the
 /// previous one from a terminal. It returns the process exit code.
-fn handle_startup_flags(store: &RuntimeStore, home: &std::path::Path, node: &std::path::Path) -> Option<i32> {
+fn handle_startup_flags(store: &RuntimeStore, home: &Path) -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let report = |result: Result<String, String>| -> i32 {
         match result {
@@ -595,8 +1039,11 @@ fn handle_startup_flags(store: &RuntimeStore, home: &std::path::Path, node: &std
             Some(url) => url,
             None => return Some(report(Err("no update channel is configured".to_owned()))),
         };
-        let resolved = match config::resolve_node_with(None, &config::repo_root()) {
-            Ok(resolved) => resolved,
+        let resolved = match resolve_global_node(home).0 {
+            Ok(config::NodeResolution::Configured(resolved)) => resolved,
+            Ok(config::NodeResolution::Unconfigured) => {
+                return Some(report(Err(config::unconfigured_message())))
+            }
             Err(error) => return Some(report(Err(error))),
         };
         return Some(report(
@@ -615,6 +1062,12 @@ pub fn run() {
     let home = config::resolve_home(&root);
     let store = RuntimeStore::new(&home);
 
+    // Resolved once, before the seed gate. An `Unconfigured` shell is a normal
+    // state for a `slim` build, so it must not skip installing the seed — only the
+    // smoke test that needs a Node (spec §3.2).
+    let (node_state, settings_problems) = resolve_global_node(&home);
+    problems.extend(settings_problems);
+
     // First run installs the seed the bundle carries, so a packaged app boots
     // offline and a checkout needs only `pnpm runtime:prepare` (design doc U3).
     if let Some(seed) = config::seed_runtime_dir() {
@@ -630,10 +1083,11 @@ pub fn run() {
                         // Mandatory gate (design doc D8.2 U1): nothing else proves
                         // this runtime can be launched by this shell, so a seed
                         // that cannot boot must not become the active runtime.
-                        let dir = store.root().join(&id);
-                        match config::resolve_node_with(None, &root) {
-                            Ok(node) => {
-                                let report = smoke::smoke(&dir, node.clone(), &smoke::smoke_home(&home), Vec::new());
+                        match &node_state {
+                            Ok(config::NodeResolution::Configured(node)) => {
+                                let dir = store.root().join(&id);
+                                let report =
+                                    smoke::smoke(&dir, node.clone(), &smoke::smoke_home(&home), Vec::new());
                                 if report.ok {
                                     eprintln!(
                                         "[dsh-app] seed runtime {id} passed its smoke test ({})",
@@ -649,7 +1103,13 @@ pub fn run() {
                                     ));
                                 }
                             }
-                            Err(error) => problems.push(error),
+                            // No Node yet: the runtime stays installed but inactive,
+                            // and no error is recorded — the form is the next step,
+                            // and `save_settings` retries this activation.
+                            Ok(config::NodeResolution::Unconfigured) => eprintln!(
+                                "[dsh-app] no Node is configured yet; skipping the seed smoke test"
+                            ),
+                            Err(error) => problems.push(error.clone()),
                         }
                     }
                     if let Err(error) = store.record_seed(&id) {
@@ -665,36 +1125,42 @@ pub fn run() {
     // able to start, and updating is exactly what a user does when the GUI is
     // unusable. They are also how the update path is exercised end to end
     // without a window.
-    let flag_node = config::load(&home, &store)
-        .map(|config| config.runtime.node)
-        .unwrap_or_else(|_| PathBuf::from("node"));
-    if let Some(code) = handle_startup_flags(&store, &home, &flag_node) {
+    if let Some(code) = handle_startup_flags(&store, &home) {
         std::process::exit(code);
     }
 
     // Which runtime and which Node this process resolved. Recorded because a
     // packaged app's Home is not the repository, so "which Node is it using" is
     // the first question whenever a bundled variant misbehaves.
-    if let Ok(config) = config::load(&home, &store) {
-        eprintln!(
-            "[dsh-app] runtime {} via node {}",
-            config.runtime.dir.display(),
-            config.runtime.node.display()
-        );
+    let startup = config::load(&home, &store);
+    match &node_state {
+        Ok(config::NodeResolution::Configured(node)) => eprintln!(
+            "[dsh-app] runtime {} via node {} ({})",
+            startup
+                .as_ref()
+                .map(|config| config.runtime.dir.display().to_string())
+                .unwrap_or_else(|_| "unresolved".to_owned()),
+            node.path.display(),
+            node.source.label()
+        ),
+        Ok(config::NodeResolution::Unconfigured) => eprintln!(
+            "[dsh-app] no Node is configured; the shell is waiting for the Node path field"
+        ),
+        Err(error) => eprintln!("[dsh-app] {error}"),
     }
 
-    let config = match config::load(&home, &store) {
-        Ok(config) => config,
+    let config = match startup {
+        Ok(config) => {
+            problems.extend(config.settings_problems.iter().cloned());
+            config
+        }
         Err(error) => {
             eprintln!("[dsh-app] {error}");
             problems.push(error);
             AppConfig {
                 home: home.clone(),
-                runtime: config::RuntimeConfig {
-                    dir: PathBuf::from("."),
-                    node: PathBuf::from("node"),
-                    node_source: config::NodeSource::Installed,
-                },
+                runtime: config::RuntimeConfig { dir: PathBuf::from(".") },
+                settings_problems: Vec::new(),
             }
         }
     };
@@ -702,7 +1168,9 @@ pub fn run() {
     let (presets, preset_problems) = preset_store::load_all(&config.home, preset_seed_dir().as_deref());
     problems.extend(preset_problems);
     let autostart = presets.first().map(|entry| entry.preset.id.clone());
-    let can_autostart = !presets.is_empty();
+    // A shell with nothing to launch with must not autostart: it would fail
+    // before the user has had a chance to fill in the form (spec §3.2).
+    let can_autostart = !presets.is_empty() && node_state.as_ref().is_ok_and(|state| state.node().is_some());
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -730,7 +1198,9 @@ pub fn run() {
             reload_presets,
             rollback_runtime,
             check_update,
-            apply_update
+            apply_update,
+            validate_runtime_paths,
+            save_settings
         ])
         .setup(move |app| {
             let probe_handle = app.handle().clone();
@@ -771,4 +1241,26 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime publishes `^22.19.0 || >=24.0.0`; the check exists only to
+    /// produce a warning, so it must never claim a version is fine when it is not,
+    /// nor refuse one it cannot parse (spec §5, Q5).
+    #[test]
+    fn the_published_node_requirement_is_read_correctly() {
+        let requirement = "^22.19.0 || >=24.0.0";
+        for version in ["22.19.0", "22.23.2", "24.0.0", "25.1.0"] {
+            assert!(satisfies(version, requirement), "{version} should satisfy");
+        }
+        for version in ["22.18.9", "23.9.0", "20.11.1"] {
+            assert!(!satisfies(version, requirement), "{version} should not satisfy");
+        }
+        // Unparseable input must never turn into a warning nobody can act on.
+        assert!(satisfies("not-a-version", requirement));
+        assert!(satisfies("24.0.0", "something else entirely"));
+    }
 }

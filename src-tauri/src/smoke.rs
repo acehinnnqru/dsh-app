@@ -72,10 +72,14 @@ pub fn smoke(
 
     let child = SupervisedChild::start(
         preset,
-        node,
-        manifest.entry_path(runtime_dir),
-        runtime_dir.to_path_buf(),
-        home.to_path_buf(),
+        // A smoke test exercises the launch path, not plugin management, so the
+        // pnpm choice is irrelevant here.
+        crate::supervisor::Launch::without_pnpm(
+            node,
+            manifest.entry_path(runtime_dir),
+            runtime_dir.to_path_buf(),
+            home.to_path_buf(),
+        ),
         Vec::new(),
         node_args,
     );

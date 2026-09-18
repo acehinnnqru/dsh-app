@@ -4,7 +4,7 @@
 //! in the user's own directory and is replaced there, while the copy inside the
 //! app bundle is only the first-run seed (design doc D10, U2/U3).
 //!
-//! ```
+//! ```text
 //! <home>/dsh-app/runtimes/
 //!   current -> 0.1.5-rc.1     the active version
 //!   previous -> 0.1.4/        the one rollback returns to
