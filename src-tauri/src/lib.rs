@@ -137,6 +137,8 @@ impl ShellState {
             "home": self.config.home.display().to_string(),
             "runtimeDir": self.config.runtime.dir.display().to_string(),
             "node": self.config.runtime.node.display().to_string(),
+            "nodeSource": self.config.runtime.node_source.label(),
+            "bundledPnpm": bundled_pnpm_dir().map(|dir| dir.display().to_string()),
             "presets": self.presets.iter().map(|entry| self.preset_row(entry)).collect::<Vec<_>>(),
             "problems": self.problems,
         })
@@ -170,10 +172,14 @@ fn apply_update(
         if !state.children.is_empty() {
             return Err("stop every running preset before updating the runtime".to_owned());
         }
+        // Resolved here rather than carried from configuration: the preset that
+        // will run afterwards may name its own Node, and this is the one the
+        // smoke test has to use.
+        let node = config::resolve_node_with(None, &config::repo_root())?;
         (
             state.store.root().to_path_buf(),
             state.config.home.clone(),
-            state.config.runtime.node.clone(),
+            node,
             state
                 .store
                 .channel_url()
@@ -186,7 +192,7 @@ fn apply_update(
     debug_assert_eq!(store.root(), store_root.as_path());
 
     let _ = app.emit("dsh://status", serde_json::json!({ "phase": "updating" }));
-    let outcome = channel::update(&store, &url, &node, &smoke::smoke_home(&home), Vec::new())?;
+    let outcome = channel::update(&store, &url, node, &smoke::smoke_home(&home), Vec::new())?;
     let payload = serde_json::to_value(&outcome).map_err(|error| error.to_string())?;
     let _ = app.emit("dsh://status", serde_json::json!({ "phase": "updated" }));
     Ok(payload)
@@ -205,6 +211,16 @@ fn rollback_runtime(state: tauri::State<'_, Mutex<ShellState>>) -> Result<String
     }
     let id = state.store.rollback()?;
     Ok(id)
+}
+
+/// The `bin` directory the bundle carries, when it carries one.
+///
+/// Its presence is what tells a user whether `dsh plugin` will work without their
+/// own pnpm: the shell puts this first on the child's PATH.
+fn bundled_pnpm_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("../Resources/bin");
+    dir.is_dir().then_some(dir)
 }
 
 /// Sample presets staged by `build.rs`, seeded into the home on first run.
@@ -350,7 +366,7 @@ fn fail_preset(app: &tauri::AppHandle, message: &str) {
 fn start_preset(app: tauri::AppHandle, preset_id: String) {
     std::thread::spawn(move || {
         let handle = app.state::<Mutex<ShellState>>();
-        let (config, preset, patch_files, node_args, capability) = {
+        let (config, preset, patch_files, node, node_args, capability) = {
             let Ok(state) = handle.lock() else {
                 eprintln!("[dsh-app] shell state is unavailable");
                 return;
@@ -358,24 +374,39 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
             if state.children.contains_key(&preset_id) {
                 return;
             }
-            let Some(resolved) = state.preset(&preset_id) else {
+            let Some(entry) = state.preset(&preset_id) else {
                 eprintln!("[dsh-app] no preset with id {preset_id}");
                 return;
+            };
+
+            // The preset's `node` is the user's explicit choice for this preset.
+            // Passing it here is what makes the documented field take effect —
+            // without it, a `slim` build could never be configured at all.
+            let resolved = match config::resolve_node_with(entry.preset.node.as_deref(), &config::repo_root()) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("[dsh-app] {error}");
+                    drop(state);
+                    fail_preset(&app, &error);
+                    return;
+                }
             };
 
             // Ask the selected Node what it can do before deciding how to launch
             // it: a `live` profile mounts the HMR row, which needs internals
             // access, and only an official Node build provides it through the
             // native addon.
-            let capability = state.node_probe.probe(&state.config.runtime.node, &state.config.runtime.dir);
+            let capability = state
+                .node_probe
+                .probe(&resolved.path, &state.config.runtime.dir);
             let mut node_args: Vec<String> = Vec::new();
-            if resolved.preset.needs_internals() {
+            if entry.preset.needs_internals() {
                 if capability.internals_available() {
                     // The addon works; nothing extra is needed.
                 } else if capability.version == "unknown" {
                     eprintln!(
                         "[dsh-app] cannot probe {}: {}",
-                        state.config.runtime.node.display(),
+                        resolved.path.display(),
                         capability.detail.as_deref().unwrap_or("unknown reason")
                     );
                 } else {
@@ -386,8 +417,9 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
             }
             (
                 state.config.clone(),
-                resolved.preset.clone(),
-                resolved.patch_files.clone(),
+                entry.preset.clone(),
+                entry.patch_files.clone(),
+                resolved,
                 node_args,
                 capability,
             )
@@ -423,7 +455,7 @@ fn start_preset(app: tauri::AppHandle, preset_id: String) {
 
         let child = SupervisedChild::start(
             preset,
-            config.runtime.node.clone(),
+            node.clone(),
             manifest.entry_path(&config.runtime.dir),
             config.runtime.dir.clone(),
             config.home.clone(),
@@ -563,8 +595,12 @@ fn handle_startup_flags(store: &RuntimeStore, home: &std::path::Path, node: &std
             Some(url) => url,
             None => return Some(report(Err("no update channel is configured".to_owned()))),
         };
+        let resolved = match config::resolve_node_with(None, &config::repo_root()) {
+            Ok(resolved) => resolved,
+            Err(error) => return Some(report(Err(error))),
+        };
         return Some(report(
-            channel::update(store, &url, node, &smoke::smoke_home(home), Vec::new()).and_then(|outcome| {
+            channel::update(store, &url, resolved, &smoke::smoke_home(home), Vec::new()).and_then(|outcome| {
                 serde_json::to_string_pretty(&outcome).map_err(|error| error.to_string())
             }),
         ));
@@ -595,10 +631,9 @@ pub fn run() {
                         // this runtime can be launched by this shell, so a seed
                         // that cannot boot must not become the active runtime.
                         let dir = store.root().join(&id);
-                        let node = config::resolve_node_for(&root, &dir);
-                        match node {
+                        match config::resolve_node_with(None, &root) {
                             Ok(node) => {
-                                let report = smoke::smoke(&dir, &node, &smoke::smoke_home(&home), Vec::new());
+                                let report = smoke::smoke(&dir, node.clone(), &smoke::smoke_home(&home), Vec::new());
                                 if report.ok {
                                     eprintln!(
                                         "[dsh-app] seed runtime {id} passed its smoke test ({})",
@@ -658,6 +693,7 @@ pub fn run() {
                 runtime: config::RuntimeConfig {
                     dir: PathBuf::from("."),
                     node: PathBuf::from("node"),
+                    node_source: config::NodeSource::Installed,
                 },
             }
         }

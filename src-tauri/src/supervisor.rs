@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::config::ResolvedNode;
 use crate::preset::Preset;
 
 /// Readiness timeout: how long the launcher may take to print its URL line.
@@ -54,11 +55,16 @@ pub struct Snapshot {
     pub stderr_tail: Vec<String>,
     /// Patch overlays this child was started with, in application order.
     pub patch_files: Vec<PathBuf>,
+    /// The Node executable in use, and where it came from.
+    pub node: PathBuf,
+    pub node_source: &'static str,
 }
 
 /// A live child plus its reported state.
 pub struct SupervisedChild {
     preset: Preset,
+    /// The runtime this child was launched with, and where it came from.
+    node: ResolvedNode,
     child: Child,
     phase: Phase,
     stderr_tail: Arc<Mutex<Vec<String>>>,
@@ -83,6 +89,23 @@ pub fn parse_ready_line(line: &str) -> Option<String> {
 /// state (the harness Electron shell strips the same names).
 fn child_environment(home: &PathBuf, preset: &Preset) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
+    // `dsh plugin` runs `pnpm` from PATH in the profile directory, so the bundle
+    // has to make its own pnpm the first one found — on a machine without pnpm
+    // the command otherwise fails with exit 127. It is unconditional because
+    // deciding by existence would make the environment depend on what else
+    // happens to be installed.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled_bin = dir.join("../Resources/bin");
+            if bundled_bin.is_dir() {
+                let existing = std::env::var("PATH").unwrap_or_default();
+                env.insert(
+                    "PATH".to_owned(),
+                    format!("{}:{existing}", bundled_bin.display()),
+                );
+            }
+        }
+    }
     for (name, value) in std::env::vars() {
         if name == "NODE_OPTIONS" || name.starts_with("DSH_") {
             continue;
@@ -109,7 +132,7 @@ impl SupervisedChild {
     /// profile layers without touching the profile's own patch file.
     pub fn start(
         preset: Preset,
-        node: PathBuf,
+        node: ResolvedNode,
         entry: PathBuf,
         cwd: PathBuf,
         home: PathBuf,
@@ -134,7 +157,7 @@ impl SupervisedChild {
         args.push("--port".to_owned());
         args.push("0".to_owned());
 
-        let mut child = Command::new(&node)
+        let mut child = Command::new(&node.path)
             .args(&args)
             .current_dir(&cwd)
             .env_clear()
@@ -143,7 +166,7 @@ impl SupervisedChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("cannot spawn {}: {error}", node.display()))?;
+            .map_err(|error| format!("cannot spawn {}: {error}", node.path.display()))?;
 
         let stdout = child.stdout.take().ok_or("child stdout was not captured")?;
         let stderr = child.stderr.take().ok_or("child stderr was not captured")?;
@@ -187,6 +210,7 @@ impl SupervisedChild {
 
         let mut supervised = SupervisedChild {
             preset,
+            node,
             child,
             phase: Phase::Starting,
             stderr_tail: tail,
@@ -258,6 +282,8 @@ impl SupervisedChild {
             phase: self.phase.clone(),
             stderr_tail: self.stderr_tail.lock().map(|guard| guard.clone()).unwrap_or_default(),
             patch_files: self.patch_files.clone(),
+            node: self.node.path.clone(),
+            node_source: self.node.source.label(),
         }
     }
 

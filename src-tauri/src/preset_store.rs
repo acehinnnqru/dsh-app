@@ -42,6 +42,9 @@ struct StoredPreset {
     /// Positional job argument, used by `kind = "task"` (not implemented yet).
     #[serde(default)]
     job: Option<String>,
+    /// Node executable to run this preset with; see `Preset::node`.
+    #[serde(default)]
+    node: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -140,6 +143,7 @@ pub fn load_one(path: &Path) -> Result<ResolvedPreset, String> {
             bundles: stored.bundles,
             patch_reload: stored.patch_reload,
             env: stored.env,
+            node: stored.node,
         },
         patch_files,
         source: path.to_path_buf(),
@@ -206,6 +210,17 @@ fn default_preset_text() -> String {
          # NOTE: `config` REPLACES the target row's whole config object; it is not a\n\
          # deep merge, so a patch must repeat every required field of that row.\n\
          # patches = [\"patch.d/10-example.yml\"]\n\
+         \n\
+         # The Node runtime to run this preset with. Leave it out to use the one the\n\
+         # app carries (`bundled` variant) or `DSH_APP_NODE`.\n\
+         #\n\
+         # It is an explicit path on purpose: an app started from Finder does not\n\
+         # inherit your shell's PATH — it sees only /usr/bin:/bin:/usr/sbin:/sbin —\n\
+         # so auto-detection would choose from an environment you did not set up.\n\
+         # Point it at a Node from nodejs.org: distribution-repackaged builds can\n\
+         # load the `require-builtin` addon and then refuse every id, which breaks\n\
+         # `patch_reload = \"live\"`.\n\
+         # node = \"/opt/homebrew/bin/node\"\n\
          \n\
          [env]\n"
     )

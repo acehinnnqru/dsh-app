@@ -31,6 +31,15 @@ pub struct Preset {
     pub patch_reload: Option<String>,
     /// Whitelisted environment additions.
     pub env: BTreeMap<String, String>,
+    /// Node executable this preset uses, when the user has chosen one.
+    ///
+    /// Deliberately explicit rather than auto-detected. A macOS app started from
+    /// Finder does not inherit the login shell's `PATH` (it gets
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`), so "find node on PATH" would silently
+    /// pick whatever that minimal environment happens to contain — which may be
+    /// absent, the wrong version, or a build whose `require-builtin` support is
+    /// missing. Naming the executable is the only reliable answer.
+    pub node: Option<String>,
 }
 
 impl Preset {

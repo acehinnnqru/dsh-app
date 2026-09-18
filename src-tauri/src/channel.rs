@@ -202,7 +202,7 @@ pub struct UpdateOutcome {
 pub fn update(
     store: &RuntimeStore,
     url: &str,
-    node: &Path,
+    node: crate::config::ResolvedNode,
     smoke_home: &Path,
     node_args: Vec<String>,
 ) -> Result<UpdateOutcome, String> {

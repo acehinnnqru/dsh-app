@@ -32,7 +32,7 @@ pub struct SmokeReport {
 /// must not be able to disturb a profile the user is running.
 pub fn smoke(
     runtime_dir: &Path,
-    node: &Path,
+    node: crate::config::ResolvedNode,
     home: &Path,
     node_args: Vec<String>,
 ) -> SmokeReport {
@@ -57,6 +57,9 @@ pub fn smoke(
         // not of the runtime, and this test must not require it.
         patch_reload: Some("startup".to_owned()),
         env: Default::default(),
+        // The smoke test runs with whatever Node the caller resolved; naming one
+        // here would make it test a different runtime than the app will use.
+        node: None,
     };
 
     if let Err(error) = crate::profile::materialize(home, &preset) {
@@ -69,7 +72,7 @@ pub fn smoke(
 
     let child = SupervisedChild::start(
         preset,
-        node.to_path_buf(),
+        node,
         manifest.entry_path(runtime_dir),
         runtime_dir.to_path_buf(),
         home.to_path_buf(),
