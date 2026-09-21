@@ -195,6 +195,53 @@ fn resolve_home_with(dsh_home: Option<&str>, from_settings: Option<&str>, user_h
     }
 }
 
+/// Where the driven home came from, for the settings sheet's diagnostics.
+///
+/// The same precedence `resolve_home` applies, reported instead of resolved: a
+/// field that shows the stored value and a line that names the effective one are
+/// only honest if they can disagree out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeSource {
+    /// `DSH_HOME` named it — one session.
+    Environment,
+    /// The settings file named it — what the user typed into the guide.
+    Settings,
+    /// Neither: the harness's own default, `$HOME/.dsh`.
+    Default,
+}
+
+impl HomeSource {
+    /// Stable label for the payload and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            HomeSource::Environment => "DSH_HOME",
+            HomeSource::Settings => "settings",
+            HomeSource::Default => "default",
+        }
+    }
+}
+
+/// Which level `resolve_home` would take the home from.
+pub fn home_source(settings: &Settings) -> HomeSource {
+    home_source_with(
+        std::env::var("DSH_HOME").ok().as_deref(),
+        settings.home.as_deref(),
+    )
+}
+
+/// `home_source` with both inputs passed in, so the rule is testable without
+/// mutating the environment of a shared test process.
+pub fn home_source_with(dsh_home: Option<&str>, from_settings: Option<&str>) -> HomeSource {
+    if non_empty(dsh_home).is_some() {
+        return HomeSource::Environment;
+    }
+    if non_empty(from_settings).is_some() {
+        return HomeSource::Settings;
+    }
+    HomeSource::Default
+}
+
 /// Expand a leading `~` the way the harness does, so a home typed as `~/.dsh`
 /// means the same thing to both.
 fn expand_tilde(value: &str, user_home: Option<&Path>) -> PathBuf {
@@ -297,9 +344,8 @@ mod tests {
 
     fn settings_naming(path: &Path) -> Settings {
         Settings {
-            schema: None,
             dsh: Some(path.display().to_string()),
-            home: None,
+            ..Settings::default()
         }
     }
 
@@ -426,6 +472,21 @@ mod tests {
         // A blank field is the default, which this test cannot create (it would
         // be the real `$HOME/.dsh`), so only the refusal is asserted here.
         assert!(check_home("relative/path").is_err());
+    }
+
+    /// The diagnostics line has to be able to say "this is only the default",
+    /// because that is the difference between a stored answer and a guess.
+    #[test]
+    fn the_home_source_names_which_level_won() {
+        assert_eq!(
+            home_source_with(Some("/tmp/session"), Some("/tmp/form")),
+            HomeSource::Environment
+        );
+        assert_eq!(home_source_with(None, Some("/tmp/form")), HomeSource::Settings);
+        assert_eq!(home_source_with(None, None), HomeSource::Default);
+        // Blank is the same as unset at either level, exactly as in resolution.
+        assert_eq!(home_source_with(Some("  "), Some("  ")), HomeSource::Default);
+        assert_eq!(home_source_with(Some("  "), Some("/tmp/form")), HomeSource::Settings);
     }
 
     #[test]

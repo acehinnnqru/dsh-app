@@ -1,40 +1,44 @@
 /**
- * Shell page: a launcher for DeepSeek Harness profiles.
+ * Shell page controller.
  *
- * The page owns no harness knowledge — it renders the state the Rust side
- * reports and forwards button presses back to it. It ships no runtime either, so
- * the one thing it has to collect is the path of the dsh executable.
+ * One payload in, one view out. The host owns every verdict (does this path run,
+ * can this home be created, is this profile launchable); this file owns only
+ * which surface is on screen and what a button means there.
+ *
+ * The view is derived, not navigated: the payload says whether a runtime is
+ * configured and whether the guide has been finished, and those two facts are
+ * the whole state machine. `step` exists only to hold the guide in place while
+ * the user walks it.
+ *
+ * @see docs/spec-shell-ux.md §3 (the state machine), §11 (the probe reads
+ * `document.documentElement.dataset.view` and checks it against these names)
  */
 
 import { invoke, listen } from './tauri.js';
+import { launcher, paintCheck, profileStep, runtimeStep, settingsSheet } from './views.js';
 
 const el = {
-  profiles: document.getElementById('profiles'),
-  empty: document.getElementById('empty'),
-  problems: document.getElementById('problems'),
   reload: document.getElementById('reload'),
-  dsh: document.getElementById('fact-dsh'),
-  dshSource: document.getElementById('fact-dsh-source'),
-  home: document.getElementById('fact-home'),
-  ui: document.getElementById('fact-ui'),
-  config: document.getElementById('config'),
-  configTitle: document.getElementById('config-title'),
-  configHint: document.getElementById('config-hint'),
-  settings: document.getElementById('fact-settings'),
-  dshPath: document.getElementById('dsh-path'),
-  dshStatus: document.getElementById('dsh-status'),
-  dshHome: document.getElementById('dsh-home'),
-  homeStatus: document.getElementById('home-status'),
-  configSave: document.getElementById('config-save'),
+  settings: document.getElementById('settings'),
+  banner: document.getElementById('banner'),
+  view: document.getElementById('view'),
+  sheet: document.getElementById('sheet'),
 };
-
-/** Phases where the child exists but its URL has not arrived yet. */
-const WORKING = new Set(['starting']);
 
 let state = { profiles: [], problems: [] };
 
 /** Failures this page raised itself, kept beside the host's problem list. */
 let clientProblems = [];
+
+/** The guide's step while it is being walked; null means "derive it". */
+let step = null;
+
+/** The profile the guide has selected. Survives a re-render, by design. */
+let selection = null;
+
+let sheetOpen = false;
+
+const currentView = () => step ?? (state.onboarded ? 'launcher' : state.configured ? 'profile' : 'runtime');
 
 /**
  * Run one host call and surface a rejection.
@@ -51,209 +55,140 @@ async function act(work) {
     clientProblems = [String(error)];
   }
   await refresh();
+  render();
 }
 
-/** One launchable row. Rebuilt on every refresh, so it stays declarative. */
-function profileRow(profile) {
-  const li = document.createElement('li');
-  li.className = 'profile';
+/* ------------------------------------------------------------ the guide */
 
-  const head = document.createElement('div');
-  head.className = 'profile-head';
+const guideHandlers = {
+  onContinue: async ({ dsh, home, dshStatus, homeStatus, submit }) => {
+    submit.disabled = true;
+    try {
+      const report = await invoke('save_settings', { dsh: dsh.trim(), home: home.trim() });
+      paintCheck(dshStatus, report.dsh);
+      paintCheck(homeStatus, report.home);
+      // A failed verdict leaves the form exactly as it is: the status line says
+      // why, and rebuilding it would throw away what the user typed.
+      if (!report.ok) return;
+      await refresh();
+      // A repair visit ends on the launcher: this user already answered the
+      // profile question once.
+      step = state.onboarded ? null : 'profile';
+      render();
+    } catch (error) {
+      paintCheck(dshStatus, { error: String(error) });
+    } finally {
+      submit.disabled = false;
+    }
+  },
+  onBack: () => {
+    step = 'runtime';
+    render();
+  },
+  onSelect: (profileId) => {
+    selection = profileId;
+    render();
+  },
+  onReload: () => act(() => invoke('reload_profiles')),
+  onStart: async (profileId) => {
+    await act(async () => {
+      await invoke('finish_onboarding', { profile: profileId });
+      if (profileId !== null) await invoke('start_profile', { profileId });
+    });
+    step = null;
+    selection = profileId ?? selection;
+    render();
+  },
+};
 
-  const title = document.createElement('span');
-  title.className = 'profile-title';
+/* --------------------------------------------------------- the launcher */
 
-  const name = document.createElement('span');
-  name.className = 'profile-name';
-  name.textContent = profile.label;
+const launcherHandlers = {
+  onReload: () => act(() => invoke('reload_profiles')),
+  onStart: (profileId) => act(() => invoke('start_profile', { profileId })),
+  onStop: (profileId) => act(() => invoke('stop_profile', { profileId })),
+  onOpen: (profileId) => act(() => invoke('open_harness', { profileId })),
+};
 
-  title.append(name);
+/* ------------------------------------------------------------- the sheet */
 
-  const badge = document.createElement('span');
-  badge.className = 'badge';
-  badge.dataset.phase = profile.phase;
-  badge.textContent = profile.phase;
+function openSheet() {
+  if (sheetOpen) return;
+  sheetOpen = true;
+  el.sheet.replaceChildren(
+    settingsSheet(state, {
+      onClose: closeSheet,
+      onSave: async ({ dsh, home, dshStatus, homeStatus, submit }) => {
+        submit.disabled = true;
+        try {
+          const report = await invoke('save_settings', { dsh: dsh.trim(), home: home.trim() });
+          paintCheck(dshStatus, report.dsh);
+          paintCheck(homeStatus, report.home);
+          if (!report.ok) return;
+          closeSheet();
+          await refresh();
+          render();
+        } catch (error) {
+          paintCheck(dshStatus, { error: String(error) });
+        } finally {
+          submit.disabled = false;
+        }
+      },
+    }),
+  );
+  el.sheet.hidden = false;
+  el.sheet.querySelector('input')?.focus();
+}
 
-  head.append(title, badge);
-  li.append(head);
+function closeSheet() {
+  if (!sheetOpen) return;
+  sheetOpen = false;
+  el.sheet.hidden = true;
+  el.sheet.replaceChildren();
+  el.settings.focus();
+}
 
-  const meta = document.createElement('p');
-  meta.className = 'profile-meta';
-  const bits = ['kind ' + profile.kind, 'profile ' + profile.profile];
-  bits.push(profile.bundles.length + ' bundle(s)');
-  meta.textContent = bits.join(' · ');
-  li.append(meta);
+/* --------------------------------------------------------------- render */
 
-  // Where the row comes from. The stylesheet trims it from the left, because the
-  // last segment is the part that answers "which directory do I edit".
-  const source = document.createElement('p');
-  source.className = 'profile-source mono';
-  source.textContent = profile.source;
-  source.title = profile.source;
-  li.append(source);
+function render() {
+  const view = currentView();
+  if (view === 'launcher') step = null;
+  document.documentElement.dataset.view =
+    view === 'runtime' ? 'onboarding-1' : view === 'profile' ? 'onboarding-2' : 'launcher';
 
-  // The host decides whether a row is startable and why not; the page only
-  // reports it, so there is exactly one definition of "this can be launched".
-  if (profile.startNote) {
-    const note = document.createElement('p');
-    note.className = 'profile-note';
-    note.textContent = profile.startNote;
-    li.append(note);
-  }
+  el.reload.hidden = view === 'runtime';
+  el.settings.hidden = view !== 'launcher';
 
-  const actions = document.createElement('div');
-  actions.className = 'profile-actions';
-
-  const running = profile.phase !== 'idle' && profile.phase !== 'exited' && profile.phase !== 'failed';
-  const ready = profile.phase === 'ready';
-
-  const start = document.createElement('button');
-  start.type = 'button';
-  start.textContent = running ? 'Restart' : 'Start';
-  start.disabled = WORKING.has(profile.phase) || Boolean(profile.startNote);
-  start.title = profile.startNote ?? '';
-  start.addEventListener('click', () =>
-    act(async () => {
-      if (running) await invoke('stop_profile', { profileId: profile.id });
-      await invoke('start_profile', { profileId: profile.id });
+  const problems = [...(state.problems ?? []), ...clientProblems];
+  const bannerText = problems.length === 1 ? problems[0] : `${problems.length} problems from the last load`;
+  el.banner.hidden = problems.length === 0;
+  el.banner.replaceChildren(
+    document.createTextNode(bannerText),
+    Object.assign(document.createElement('span'), { className: 'spacer' }),
+    Object.assign(document.createElement('button'), {
+      type: 'button',
+      textContent: 'Dismiss',
+      onclick: () => act(() => invoke('dismiss_problems')),
     }),
   );
 
-  const open = document.createElement('button');
-  open.type = 'button';
-  open.textContent = 'Open';
-  open.disabled = !ready;
-  open.addEventListener('click', () => act(() => invoke('open_harness', { profileId: profile.id })));
-
-  const stop = document.createElement('button');
-  stop.type = 'button';
-  stop.textContent = 'Stop';
-  stop.disabled = !running;
-  stop.addEventListener('click', () => act(() => invoke('stop_profile', { profileId: profile.id })));
-
-  actions.append(start, open, stop);
-  li.append(actions);
-
-  const tail = profile.stderrTail ?? [];
-  if (tail.length > 0) {
-    const details = document.createElement('details');
-    const summary = document.createElement('summary');
-    summary.textContent = 'stderr (last ' + tail.length + ' lines)';
-    const pre = document.createElement('pre');
-    pre.textContent = tail.join('\n');
-    details.append(summary, pre);
-    li.append(details);
-  }
-
-  return li;
-}
-
-function render() {
-  el.profiles.replaceChildren(...state.profiles.map(profileRow));
-  el.empty.hidden = state.profiles.length > 0;
-
-  const problems = [...(state.problems ?? []), ...clientProblems];
-  el.problems.hidden = problems.length === 0;
-  el.problems.textContent = problems.join('\n');
-
-  renderConfig();
-
-  el.dsh.textContent = state.dsh ?? '—';
-  el.dshSource.textContent = state.dshSource ?? '—';
-  el.home.textContent = state.home ?? '—';
-  // Where to edit these by hand. The file is TOML precisely so that this is a
-  // reasonable thing to do.
-  el.settings.textContent = state.settingsFile ?? '—';
-  // Proves which page build is running, so "fields stayed empty" can never be
-  // diagnosed from a screenshot of stale UI again.
-  el.ui.textContent = state.uiVersion ?? '—';
-}
-
-/* The dsh form.
- *
- * Only the shell page can render this: with nothing configured there is no
- * runtime to draw a settings page, and this app ships none. Nothing here
- * validates on its own — every verdict comes from the host, so there is exactly
- * one definition of "this path works".
- */
-
-let configTouched = false;
-
-function setStatus(element, text, kind) {
-  element.textContent = text;
-  element.dataset.kind = kind ?? '';
-  element.hidden = text === '';
-}
-
-/**
- * Show the form whenever the shell cannot launch anything, or when the path the
- * user saved does not work. "Nothing configured yet" is not an error: it is the
- * prompt.
- */
-function renderConfig() {
-  const settings = state.settings ?? {};
-  const needsConfig = !state.configured || Boolean(state.dshProblem) || Boolean(settings.problem);
-
-  el.config.hidden = !needsConfig;
-  if (!needsConfig) return;
-
-  el.configTitle.textContent = state.configured ? 'Runtime problem' : 'A dsh executable is required';
-
-  const hint = [];
-  hint.push(
-    state.configured
-      ? 'Currently launching ' + state.dsh + ' (chosen by ' + (state.dshSource ?? 'unknown') + ').'
-      : 'This app ships no runtime. Name the dsh executable it should launch.',
-  );
-  if (settings.problem) hint.push(settings.problem);
-  if (state.dshProblem) hint.push(state.dshProblem);
-  el.configHint.textContent = hint.join('\n');
-
-  // Never fight the user's typing: the payload also arrives on every status
-  // event, including ones unrelated to this form.
-  if (!configTouched) {
-    el.dshPath.value = settings.dsh ?? '';
-    // Prefilled with what is actually in use, so the field answers "which home am
-    // I running against" instead of asking the user to know it. A bare ~/.dsh is
-    // accepted and expanded.
-    el.dshHome.value = settings.home ?? state.home ?? '';
-    if (el.dshStatus.textContent === '' && state.configured) {
-      setStatus(el.dshStatus, state.dsh + ' works', 'ok');
+  if (view === 'runtime') {
+    el.view.replaceChildren(runtimeStep(state, guideHandlers));
+  } else if (view === 'profile') {
+    const selectable = (state.profiles ?? []).filter((profile) => !profile.startNote);
+    if (selection === null || !selectable.some((profile) => profile.id === selection)) {
+      selection = selectable[0]?.id ?? null;
     }
+    el.view.replaceChildren(profileStep(state, { ...guideHandlers, selection }));
+  } else {
+    el.view.replaceChildren(launcher(state, launcherHandlers));
   }
-}
 
-for (const field of [el.dshPath, el.dshHome]) {
-  field.addEventListener('input', () => {
-    configTouched = true;
-  });
+  // The sheet is not re-rendered from here: a status event must not fight what
+  // the user is typing into it. Its values are read when it opens, and Save is
+  // the only thing that writes.
+  if (sheetOpen && view !== 'launcher') closeSheet();
 }
-
-/** One validated field, as a status line. */
-function checkLine(label, check) {
-  if (!check) return 'Not saved: both fields are required.';
-  if (check.error) return check.path + ': ' + check.error;
-  return check.path + (check.version ? ' ' + check.version : '') + ' works';
-}
-
-el.configSave.addEventListener('click', async () => {
-  const dsh = el.dshPath.value.trim();
-  const dshHome = el.dshHome.value.trim();
-  setStatus(el.dshStatus, 'Checking…', undefined);
-  setStatus(el.homeStatus, '', undefined);
-  try {
-    const report = await invoke('save_settings', { dsh, home: dshHome });
-    setStatus(el.dshStatus, checkLine('dsh', report.dsh), report.dsh?.ok ? 'ok' : 'err');
-    if (report.home) {
-      setStatus(el.homeStatus, checkLine('home', report.home), report.home.ok ? 'ok' : 'err');
-    }
-    configTouched = false;
-  } catch (error) {
-    setStatus(el.dshStatus, String(error), 'err');
-  }
-  await refresh();
-});
 
 async function refresh() {
   try {
@@ -261,23 +196,83 @@ async function refresh() {
   } catch (error) {
     state = { profiles: [], problems: [String(error)] };
   }
-  render();
 }
 
-el.reload.addEventListener('click', () => act(() => invoke('reload_profiles')));
+/* ------------------------------------------------------- window wiring */
 
-await listen('dsh://status', (event) => {
-  // Starting a profile without a configured executable is guidance, not a
-  // failure: the host says so with this phase instead of pushing an error into
-  // the problems list.
-  if (event?.payload?.phase === 'unconfigured') {
-    el.config.hidden = false;
-    el.configTitle.textContent = 'A dsh executable is required';
-    el.configHint.textContent = event.payload.error ?? 'Name the dsh executable this app should launch.';
-    el.dshPath.focus();
-    return;
-  }
-  void refresh();
+/**
+ * `⌘,` opens the settings sheet; `Esc` closes whatever is on top.
+ *
+ * The window's own controls belong to AppKit now: the title bar drags, the
+ * traffic lights close, minimize and zoom, and the page handles nothing of that.
+ */
+function trackShortcuts({ onSettings, onEscape }) {
+  window.addEventListener('keydown', (event) => {
+    if (event.key === ',' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      onSettings();
+      return;
+    }
+    if (event.key === 'Escape') onEscape();
+  });
+}
+
+/**
+ * Accept a dropped file: the guide's executable field is a path nobody wants to
+ * type, and Finder is where that path usually is.
+ */
+async function trackFileDrops({ onPath, onHighlight }) {
+  await listen('tauri://drag-enter', () => onHighlight(true));
+  await listen('tauri://drag-leave', () => onHighlight(false));
+  await listen('tauri://drag-drop', (event) => {
+    onHighlight(false);
+    const path = event?.payload?.paths?.[0];
+    if (typeof path === 'string' && path !== '') onPath(path);
+  });
+}
+
+/* ------------------------------------------------------------------ boot */
+
+trackShortcuts({
+  onSettings: () => {
+    if (currentView() === 'launcher') openSheet();
+  },
+  onEscape: () => closeSheet(),
 });
 
+el.reload.addEventListener('click', () => act(() => invoke('reload_profiles')));
+el.settings.addEventListener('click', () => openSheet());
+
 await refresh();
+render();
+
+// The window is created hidden, and this is what shows it. Not inside
+// requestAnimationFrame: a hidden window is not guaranteed to run animation
+// frames at all, and the first thing that happened when this was moved there was
+// the watchdog stepping in three seconds later. The DOM is built by the line
+// above, so there is nothing left to wait for.
+invoke('shell_ready').catch((error) => {
+  // Not silent: the watchdog will show the window anyway, but the reason belongs
+  // in the log next to it.
+  console.error('shell_ready failed:', error);
+});
+
+// Subscriptions and drop wiring come after the first paint: the page is already
+// usable by then, and a rejected listen must not cost it its render.
+listen('dsh://status', () => {
+  void refresh().then(render);
+}).catch(() => {});
+
+// The guide's executable field is a path nobody wants to type, so a dropped file
+// fills whichever field is on screen.
+trackFileDrops({
+  onHighlight: (dropping) => {
+    document.documentElement.dataset.dropping = String(dropping);
+  },
+  onPath: (path) => {
+    const input = (sheetOpen ? el.sheet : el.view).querySelector('input');
+    if (input === null) return;
+    input.value = path;
+    input.focus();
+  },
+}).catch(() => {});

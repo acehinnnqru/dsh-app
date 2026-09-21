@@ -10,72 +10,37 @@
     <link rel="stylesheet" href="shell.css" />
   </head>
   <body>
-    <main>
-      <header>
-        <h1>DeepSeek Harness</h1>
-        <button id="reload" type="button" class="ghost"
-                title="Re-read the profile list from the harness home">Reload list</button>
-      </header>
+    <!-- The window has a system title bar and system traffic lights, and the page
+         starts below them. Nothing in here is draggable: AppKit owns the title
+         bar, so the page needs no drag region and no window controls of its own.
+         @see docs/spec-shell-ux.md §2.2 -->
+    <header class="page-head" data-tauri-drag-region="deep">
+      <span class="brand">
+        <span class="mark" aria-hidden="true">›</span>
+        <span class="brand-name">DeepSeek Harness</span>
+      </span>
+      <span class="spacer"></span>
+      <button id="reload" class="icon" type="button" aria-label="Reload the profile list" title="Reload the profile list" hidden>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8M13.4 2.4V5.2H10.6" /></svg>
+      </button>
+      <button id="settings" class="icon" type="button" aria-label="Settings" title="Settings" hidden>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.1" /><path d="M8 1.7v1.5M8 12.8v1.5M1.7 8h1.5M12.8 8h1.5M3.6 3.6l1 1M11.4 11.4l1 1M12.4 3.6l-1 1M4.6 11.4l-1 1" /></svg>
+      </button>
+    </header>
 
-      <section id="fatal" class="problems" hidden></section>
-      <section id="problems" class="problems" hidden></section>
+    <!-- Host problems, when there are any. The launcher keeps no other
+         diagnostics of its own: they live in the settings sheet. -->
+    <div id="banner" class="banner" role="status" hidden></div>
 
-      <!-- Rendered by the shell page, not by the runtime: this app ships no
-           runtime of its own, so nothing else is there to ask the question. -->
-      <section id="config" class="card" hidden>
-        <h2 id="config-title">A dsh executable is required</h2>
-        <p id="config-hint" class="config-hint"></p>
+    <main id="view" class="view" role="main"></main>
 
-        <label class="field">
-          <span class="field-label">dsh path <em>required</em></span>
-          <input id="dsh-path" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="/opt/homebrew/bin/dsh" />
-          <span id="dsh-status" class="field-status"></span>
-        </label>
+    <!-- The settings sheet is built when it opens, never from a status event. -->
+    <div id="sheet" class="sheet" hidden></div>
 
-        <label class="field">
-          <span class="field-label">Harness home <em>required</em></span>
-          <input id="dsh-home" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="~/.dsh" />
-          <span id="home-status" class="field-status"></span>
-        </label>
+    <!-- Rendered by shell.js when the page module fails to evaluate: with no
+         runtime behind the page, this strip is the only place a failure shows. -->
+    <div id="fatal" class="fatal" hidden></div>
 
-        <div class="config-actions">
-          <button id="config-save" type="button">Validate and save</button>
-          <span class="config-note">
-            Run <code>which dsh</code> in a terminal for the first field. The home is where
-            profiles, sessions, and credentials live, and it is shared with the
-            <code>dsh</code> CLI — leave it at <code>~/.dsh</code> unless you keep your
-            harness somewhere else.
-          </span>
-        </div>
-      </section>
-
-      <ul id="profiles" class="profiles"></ul>
-
-      <p id="empty" class="empty" hidden>
-        No profiles found. Create one with the <code>dsh</code> CLI
-        (<code>dsh --profile web</code>, or
-        <code>dsh plugin --profile NAME add PACKAGE</code>), then press
-        <em>Reload list</em>.
-      </p>
-
-      <details class="facts-wrap">
-        <summary>Runtime</summary>
-        <dl class="facts">
-          <dt>dsh</dt>
-          <dd id="fact-dsh" class="mono">—</dd>
-          <dt>Chosen by</dt>
-          <dd id="fact-dsh-source" class="mono">—</dd>
-          <dt>Home</dt>
-          <dd id="fact-home" class="mono">—</dd>
-          <dt>Settings</dt>
-          <dd id="fact-settings" class="mono">—</dd>
-          <dt>Shell</dt>
-          <dd id="fact-ui" class="mono">—</dd>
-        </dl>
-      </details>
-    </main>
     <script type="module" src="shell.js"></script>
   </body>
 </html>

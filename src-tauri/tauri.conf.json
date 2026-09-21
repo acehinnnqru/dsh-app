@@ -7,15 +7,26 @@
     "frontendDist": "../ui"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "shell",
         "title": "DeepSeek Harness",
-        "width": 620,
-        "height": 460,
+        "width": 640,
+        "height": 580,
+        "minWidth": 520,
+        "minHeight": 440,
         "resizable": true,
-        "center": true
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": true,
+        "visible": false,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {

@@ -14,6 +14,7 @@
 //! profile and nothing else is shared.
 
 mod config;
+mod harness_window;
 mod profile;
 mod settings;
 mod supervisor;
@@ -22,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, RunEvent};
 
 use config::AppConfig;
 use profile::DiscoveredProfile;
@@ -44,6 +45,9 @@ struct ShellState {
     children: BTreeMap<String, SupervisedChild>,
     /// Problems found while loading state, surfaced in the UI.
     problems: Vec<String>,
+    /// Whether the page has reported its first paint. The watchdog in `run`
+    /// consults this before showing a window the page never showed itself.
+    shell_shown: bool,
 }
 
 impl ShellState {
@@ -81,21 +85,33 @@ impl ShellState {
     }
 
     /// Everything the UI renders.
+    ///
+    /// Re-resolved per call on purpose — the executable and the home can change
+    /// the moment the guide or the sheet saves, and this payload is the only
+    /// place the page reads them from — but resolved **once** per call: the
+    /// settings file used to be read twice, on every status event.
     fn snapshot(&self) -> serde_json::Value {
-        // Re-resolved per call on purpose: the executable can change the moment
-        // the user saves the form, and the payload is the only place the page
-        // reads it from.
-        let (dsh, dsh_problem) = dsh_report(&self.config.config_dir);
         let saved = settings::load(&self.config.config_dir);
+        let (dsh, dsh_problem) = dsh_json(&config::resolve_dsh(&saved.settings));
         serde_json::json!({
             "uiVersion": UI_VERSION,
+            // What the page lays its traffic lights and shortcuts out for. The
+            // page never guesses at the platform.
+            "platform": std::env::consts::OS,
             "home": self.config.home.display().to_string(),
+            // Which level the driven home came from, so the sheet can say that a
+            // value is only the default rather than something the user chose.
+            "homeSource": config::home_source(&saved.settings).label(),
             // `configured: false` is guidance, not a failure: the page shows the
-            // form instead of an error.
+            // guide instead of an error.
             "configured": dsh.is_some(),
             "dsh": dsh.as_ref().and_then(|value| value["path"].as_str()),
             "dshSource": dsh.as_ref().and_then(|value| value["source"].as_str()),
             "dshProblem": dsh_problem,
+            // The guide's own state, and the only thing that decides whether the
+            // page shows the guide or the launcher.
+            "onboarded": saved.settings.onboarded,
+            "pickedProfile": saved.settings.profile,
             "settingsFile": saved.path.display().to_string(),
             "settings": {
                 "dsh": saved.settings.dsh,
@@ -156,8 +172,11 @@ fn launch_dsh(config: &AppConfig) -> Result<config::DshResolution, String> {
 ///
 /// `value: None` means **unconfigured**, which is a state and not a failure; a
 /// message is only present when something the user named is unusable.
-fn dsh_report(config_dir: &Path) -> (Option<serde_json::Value>, Option<String>) {
-    match resolve_global_dsh(config_dir) {
+/// Takes an already-resolved answer instead of resolving again: one payload is
+/// one read of the settings file, and "which dsh" used to be read twice on every
+/// status event.
+fn dsh_json(resolution: &Result<config::DshResolution, String>) -> (Option<serde_json::Value>, Option<String>) {
+    match resolution {
         Ok(resolution) => {
             let value = resolution.dsh().map(|dsh| {
                 serde_json::json!({
@@ -167,12 +186,12 @@ fn dsh_report(config_dir: &Path) -> (Option<serde_json::Value>, Option<String>) 
             });
             (value, None)
         }
-        Err(error) => (None, Some(error)),
+        Err(error) => (None, Some(error.clone())),
     }
 }
 
 /// One path the user typed, as validated.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct PathCheck {
     /// The path they named.
     path: String,
@@ -209,13 +228,14 @@ struct ValidationReport {
 fn validate_paths(config_dir: &Path, dsh: Option<&str>, home: Option<&str>) -> ValidationReport {
     let saved = settings::load(config_dir);
 
-    // A blank field means "still unconfigured", not "invalid": a saved value is
-    // allowed to stand in, so the form can report the state it would leave behind
-    // rather than complaining about a field the user cleared.
-    let dsh_check = match dsh.map(str::trim) {
-        Some("") | None => saved.settings.dsh.as_deref().map(check_dsh),
-        Some(value) => Some(check_dsh(value)),
-    };
+    // The executable has no default and no fallback: the field starts empty and
+    // a blank value is a verdict rather than a reason to reuse the saved one.
+    // The asymmetry with the home below is deliberate — the home has a default,
+    // the executable does not.
+    let dsh_check = Some(match dsh.map(str::trim) {
+        Some("") | None => missing_dsh(),
+        Some(value) => check_dsh(value),
+    });
     let home_check = match home.map(str::trim) {
         Some("") | None => saved.settings.home.as_deref().map(check_home),
         Some(value) => Some(check_home(value)),
@@ -242,10 +262,12 @@ fn validate_paths(config_dir: &Path, dsh: Option<&str>, home: Option<&str>) -> V
 /// values again from disk, so there is no seed to install and no update to retry.
 #[tauri::command]
 fn save_settings(
+    window: tauri::Window,
     state: tauri::State<'_, Mutex<ShellState>>,
     dsh: String,
     home: String,
 ) -> Result<ValidationReport, String> {
+    ensure_shell(&window)?;
     let config_dir = lock_state(&state)?.config.config_dir.clone();
     let report = validate_paths(&config_dir, Some(&dsh), Some(&home));
     if !report.ok {
@@ -253,11 +275,57 @@ fn save_settings(
     }
     settings::save(&config_dir, &dsh, &home)?;
     // The write just made these the configured values, so report the state the
-    // shell is now in rather than the one it was in before the save.
+    // shell is now in rather than the one it was in before the save — and adopt
+    // the home it named, because the guide's next step lists *that* home's
+    // profiles.
+    {
+        let mut state = lock_state(&state)?;
+        adopt_settings(&mut state);
+    }
     Ok(ValidationReport {
         configured: true,
         ..report
     })
+}
+
+/// Refuse a command that may only be issued from the shell's own page.
+///
+/// The ACL does not gate app commands, and the harness window runs a page this
+/// app did not write, so anything that writes the shell's configuration has to
+/// ask who is calling. @see docs/spec-shell-ux.md §9.11
+fn ensure_shell(window: &tauri::Window) -> Result<(), String> {
+    if window.label() == SHELL_LABEL {
+        return Ok(());
+    }
+    Err(format!("{} may not configure the shell", window.label()))
+}
+
+/// Re-resolve everything a settings file implies: the driven home, and the
+/// profiles under it.
+///
+/// Called after every save, because until this runs the shell keeps driving the
+/// previous home — which used to be invisible and is now the guide's own second
+/// step.
+fn adopt_settings(state: &mut ShellState) {
+    state.config = config::load(&state.config.config_dir);
+    let mut problems = state.config.settings_problems.clone();
+    if let Err(error) = std::fs::create_dir_all(&state.config.home) {
+        problems.push(format!("cannot create {}: {error}", state.config.home.display()));
+    }
+    let (profiles, discovery) = profile::discover(&state.config.home);
+    state.profiles = profiles;
+    state.problems = problems.into_iter().chain(discovery).collect();
+}
+
+/// The verdict for a blank executable field.
+fn missing_dsh() -> PathCheck {
+    PathCheck {
+        path: String::new(),
+        ok: false,
+        version: None,
+        error: Some("a dsh executable is required".to_owned()),
+        warnings: Vec::new(),
+    }
 }
 
 /// Check one harness home, as a {@link PathCheck} for the form.
@@ -369,44 +437,6 @@ fn lock_state<'a>(state: &'a tauri::State<'_, Mutex<ShellState>>) -> Result<Mute
         .map_err(|error| format!("shell state is unavailable: {error}"))
 }
 
-/// The window label that hosts one profile's GUI.
-fn harness_label(profile_id: &str) -> String {
-    format!("harness:{profile_id}")
-}
-
-/// Focus an existing harness window for this profile, or create it at `url`.
-fn open_harness_window(app: &tauri::AppHandle, profile_id: &str, url: &str) -> Result<(), String> {
-    let label = harness_label(profile_id);
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-
-    // The guard is attached before the URL loads, so the only navigation the
-    // runtime's page can perform stays on its own authority. Comparing scheme,
-    // host and explicit port — never `Origin`, which maps an absent port to the
-    // scheme default — keeps a profile pointed at a different loopback service
-    // reachable through this window.
-    let parsed = tauri::Url::parse(url).map_err(|error| format!("invalid harness url {url}: {error}"))?;
-    let allowed = (
-        parsed.scheme().to_owned(),
-        parsed.host_str().unwrap_or_default().to_owned(),
-        parsed.port_or_known_default(),
-    );
-
-    WebviewWindowBuilder::new(app, &label, WebviewUrl::External(parsed))
-        .title(format!("DeepSeek Harness — {profile_id}"))
-        .inner_size(1280.0, 860.0)
-        .on_navigation(move |target| {
-            target.scheme() == allowed.0
-                && target.host_str() == Some(allowed.1.as_str())
-                && target.port_or_known_default() == allowed.2
-        })
-        .build()
-        .map_err(|error| format!("cannot open the harness window: {error}"))?;
-    Ok(())
-}
-
 /// Record what the shell page reported about itself.
 #[tauri::command]
 fn ui_probe(marker: String) {
@@ -448,7 +478,7 @@ fn open_harness(
             })
             .ok_or_else(|| format!("profile {profile_id} is not ready"))?
     };
-    open_harness_window(&app, &profile_id, &url)
+    harness_window::open(&app, &profile_id, &url)
 }
 
 /// Stop one profile's runtime and close its window.
@@ -464,9 +494,7 @@ fn stop_profile(
             child.shutdown();
         }
     }
-    if let Some(window) = app.get_webview_window(&harness_label(&profile_id)) {
-        let _ = window.close();
-    }
+    harness_window::close(&app, &profile_id);
     Ok(())
 }
 
@@ -474,10 +502,60 @@ fn stop_profile(
 #[tauri::command]
 fn reload_profiles(state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), String> {
     let mut state = lock_state(&state)?;
-    let home = state.config.home.clone();
-    let (profiles, problems) = profile::discover(&home);
-    state.profiles = profiles;
-    state.problems = problems;
+    adopt_settings(&mut state);
+    Ok(())
+}
+
+/// Move, minimize, zoom, drag or close one of this app's windows.
+///
+/// The shell's chrome is a page, so every button on it lands here — including
+/// the three lights and the drag surface of the harness window, which is why
+/// this command is open to every window while the configuration commands are
+/// not. The action is validated rather than forwarded: the harness page can call
+/// it too, and an unknown string is a bug rather than a no-op.
+/// Show the shell window once its page has painted.
+///
+/// The window is created hidden so the first frame is the styled page and not a
+/// white flash. The watchdog in `run` shows it anyway if this never arrives: an
+/// invisible app with a broken page is the worst failure mode this shell has.
+#[tauri::command]
+fn shell_ready(app: tauri::AppHandle, state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), String> {
+    if let Ok(mut state) = state.lock() {
+        state.shell_shown = true;
+    }
+    let Some(window) = app.get_webview_window(SHELL_LABEL) else {
+        return Err("the shell window does not exist".to_owned());
+    };
+    window.show().map_err(|error| error.to_string())?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+/// Record which profile the guide ended on, and that it ended.
+#[tauri::command]
+fn finish_onboarding(
+    window: tauri::Window,
+    state: tauri::State<'_, Mutex<ShellState>>,
+    profile: Option<String>,
+) -> Result<(), String> {
+    ensure_shell(&window)?;
+    let (config_dir, known) = {
+        let state = lock_state(&state)?;
+        let known = profile.as_deref().is_some_and(|name| state.profile(name).is_some());
+        (state.config.config_dir.clone(), known)
+    };
+    // A name the shell does not know is recorded as none rather than refused:
+    // the profile may have been deleted between the guide listing it and the
+    // button being pressed, and that is not worth failing the guide over.
+    settings::save_onboarding(&config_dir, if known { profile.as_deref() } else { None })?;
+    Ok(())
+}
+
+/// Clear the problems the launcher's banner is showing.
+#[tauri::command]
+fn dismiss_problems(window: tauri::Window, state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), String> {
+    ensure_shell(&window)?;
+    lock_state(&state)?.problems.clear();
     Ok(())
 }
 
@@ -575,7 +653,7 @@ fn spawn_profile(app: tauri::AppHandle, profile_id: String) {
                             "dsh://status",
                             serde_json::json!({ "profileId": profile_id, "phase": "ready", "url": url }),
                         );
-                        if let Err(error) = open_harness_window(&app, &profile_id, &url) {
+                        if let Err(error) = harness_window::open(&app, &profile_id, &url) {
                             eprintln!("[dsh-app] {error}");
                         }
                     }
@@ -642,6 +720,9 @@ fn install_page_probe(app: &tauri::AppHandle) {
           internals: typeof window.__TAURI_INTERNALS__,
           invoke: typeof window.__TAURI_INTERNALS__?.invoke,
           global: typeof window.__TAURI__,
+          // Which surface the state machine produced. Without it, "the guide did
+          // not appear" and "the guide appeared and was skipped" look the same.
+          view: document.documentElement.dataset.view ?? null,
           scripts: [...document.scripts].map((s) => s.src || '(inline)'),
           error: window.__DSH_PAGE_ERROR__ ?? null,
         };
@@ -738,7 +819,10 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // `show` as well as focus: a second launch during the hidden start-up
+            // window would otherwise be a no-op.
             if let Some(window) = app.get_webview_window(SHELL_LABEL) {
+                let _ = window.show();
                 let _ = window.set_focus();
             }
         }))
@@ -747,6 +831,7 @@ pub fn run() {
             profiles,
             children: BTreeMap::new(),
             problems,
+            shell_shown: false,
         }))
         .invoke_handler(tauri::generate_handler![
             shell_state,
@@ -755,7 +840,10 @@ pub fn run() {
             stop_profile,
             start_profile,
             reload_profiles,
-            save_settings
+            save_settings,
+            shell_ready,
+            finish_onboarding,
+            dismiss_problems
         ])
         .setup(move |app| {
             // Nothing is started here on purpose: the launcher opens on its list,
@@ -766,6 +854,28 @@ pub fn run() {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(6));
                 install_page_probe(&probe_handle);
+            });
+
+            // The window is created hidden, and the page shows it once it has
+            // painted. If that never happens the app would be invisible with
+            // nothing anywhere saying why, so the window is shown regardless —
+            // late, and with a line on stderr.
+            let watchdog = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let shown = watchdog
+                    .state::<Mutex<ShellState>>()
+                    .lock()
+                    .map(|state| state.shell_shown)
+                    .unwrap_or(false);
+                if shown {
+                    return;
+                }
+                eprintln!("[dsh-app] the page never reported ready; showing the window anyway");
+                if let Some(window) = watchdog.get_webview_window(SHELL_LABEL) {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             });
             Ok(())
         })
@@ -889,8 +999,9 @@ mod tests {
     /// The IPC surface has two halves that cannot be checked against each other:
     /// the `invoke('…')` calls in the page, and the commands registered below.
     /// A mismatch is invisible — the button simply does nothing — so it is
-    /// asserted here instead. The command list is read out of this file rather
-    /// than restated, so it cannot go stale.
+    /// asserted here instead. Neither half is restated: the command list is read
+    /// out of this file, and the call sites out of every `.js` file under `ui/`,
+    /// so the scan cannot go stale as the page gains modules.
     #[test]
     fn every_command_the_page_invokes_is_registered() {
         let source = include_str!("lib.rs");
@@ -901,22 +1012,33 @@ mod tests {
             .map(|rest| rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or(""))
             .collect();
 
-        let page = include_str!("../../ui/shell-page.js");
-        let invoked: Vec<&str> = page
-            .match_indices("invoke('")
-            .filter_map(|(at, _)| page[at..].split_once("invoke('").map(|(_, rest)| rest))
-            .map(|rest| rest.split('\'').next().unwrap_or(""))
-            .filter(|name| !name.starts_with("plugin:"))
-            .collect();
+        let mut invoked: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir("../ui").expect("the ui directory is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "js") {
+                continue;
+            }
+            let page = std::fs::read_to_string(&path).expect("a page file is readable");
+            invoked.extend(page_invocations(&page));
+        }
 
         assert!(!declared.is_empty(), "no commands were found; the scan broke, do not delete it");
         assert!(!invoked.is_empty(), "the page invokes nothing; the scan broke, do not delete it");
-        for name in invoked {
+        for name in &invoked {
             assert!(
-                declared.contains(&name),
-                "the page invokes `{name}`, which is not a registered command; registered: {declared:?}"
+                declared.contains(&name.as_str()),
+                "a page file invokes `{name}`, which is not a registered command; registered: {declared:?}"
             );
         }
+    }
+
+    /// The command names one page file invokes, minus the plugin protocol.
+    fn page_invocations(page: &str) -> Vec<String> {
+        page.match_indices("invoke('")
+            .filter_map(|(at, _)| page[at..].split_once("invoke('").map(|(_, rest)| rest))
+            .map(|rest| rest.split('\'').next().unwrap_or("").to_owned())
+            .filter(|name| !name.starts_with("plugin:"))
+            .collect()
     }
 
     /// The only carrier this shell drives is the web one; everything else says so
@@ -935,7 +1057,7 @@ mod tests {
     #[test]
     fn an_unconfigured_home_reports_no_problem() {
         let home = TempHome::new("unconfigured");
-        let (dsh, problem) = dsh_report(home.path());
+        let (dsh, problem) = dsh_json(&config::resolve_dsh(&settings::load(home.path()).settings));
         assert!(dsh.is_none());
         assert!(problem.is_none(), "{problem:?}");
     }
@@ -946,7 +1068,7 @@ mod tests {
         let path = home.fake_dsh("dsh", "0.1.6-alpha.2");
         settings::save(home.path(), &path.display().to_string(), "").expect("the save succeeds");
 
-        let (dsh, problem) = dsh_report(home.path());
+        let (dsh, problem) = dsh_json(&config::resolve_dsh(&settings::load(home.path()).settings));
         assert!(problem.is_none(), "{problem:?}");
         let dsh = dsh.expect("a dsh is configured");
         assert_eq!(dsh["path"], path.display().to_string());
@@ -961,7 +1083,7 @@ mod tests {
         let missing = home.path().join("gone");
         settings::save(home.path(), &missing.display().to_string(), "").expect("the save succeeds");
 
-        let (dsh, problem) = dsh_report(home.path());
+        let (dsh, problem) = dsh_json(&config::resolve_dsh(&settings::load(home.path()).settings));
         assert!(dsh.is_none());
         assert!(
             problem.as_ref().is_some_and(|message| message.contains("not an executable file")),
@@ -1015,26 +1137,36 @@ mod tests {
     #[test]
     fn the_home_field_is_checked_and_created() {
         let home = TempHome::new("home-field");
+        let dsh = home.fake_dsh("dsh", "0.1.6-alpha.2");
         let target = home.path().join("harness");
-        let report = validate_paths(home.path(), None, Some(&target.display().to_string()));
+        let report = validate_paths(
+            home.path(),
+            Some(&dsh.display().to_string()),
+            Some(&target.display().to_string()),
+        );
         assert!(report.ok, "{:?}", report.home.as_ref().and_then(|check| check.error.clone()));
         assert!(target.is_dir(), "an accepted home is created so the child can use it");
 
-        let relative = validate_paths(home.path(), None, Some("relative/home"));
+        let relative = validate_paths(home.path(), Some(&dsh.display().to_string()), Some("relative/home"));
         assert!(!relative.ok);
         assert!(relative.home.expect("a check was made").error.is_some());
     }
 
+    /// The executable has no default and no fallback — that is the ask, in code.
     #[test]
-    fn a_blank_field_falls_back_to_the_saved_value() {
+    fn a_blank_executable_is_required_even_with_one_saved() {
         let home = TempHome::new("blank-field");
         let path = home.fake_dsh("dsh", "0.1.6-alpha.2");
         settings::save(home.path(), &path.display().to_string(), "").expect("the save succeeds");
 
         let report = validate_paths(home.path(), Some("   "), None);
-        assert!(report.ok);
+        assert!(!report.ok);
+        let check = report.dsh.expect("a check was made");
+        assert!(!check.ok);
+        assert!(check.error.as_deref().is_some_and(|error| error.contains("required")), "{check:?}");
+        // A saved value is still a working runtime — the verdict is about the
+        // field the user emptied, not about the machine.
         assert!(report.configured);
-        assert_eq!(report.dsh.expect("a check was made").path, path.display().to_string());
     }
 
     /// Every profile the harness has created is listed, and none of them is
@@ -1053,6 +1185,7 @@ mod tests {
             profiles,
             children: BTreeMap::new(),
             problems: Vec::new(),
+            shell_shown: false,
         };
         let snapshot = state.snapshot();
         let rows = snapshot["profiles"].as_array().expect("rows");
@@ -1068,5 +1201,77 @@ mod tests {
         assert!(rows[1]["startNote"].is_string());
         assert_eq!(rows[2]["id"], "web");
         assert_eq!(rows[2]["startNote"], serde_json::Value::Null);
+    }
+
+    /// Step 2 of the guide lists the home step 1 just saved, so a save has to
+    /// adopt it in the same breath: a home resolved once at startup would show
+    /// the previous directory's profiles at exactly the moment they matter.
+    #[test]
+    fn adopting_settings_re_reads_the_home_and_its_profiles() {
+        let config_dir = TempHome::new("adopt-config");
+        let first = TempHome::new("adopt-first");
+        let second = TempHome::new("adopt-second");
+        second.profile("web", &[profile::WEB_BUNDLE]);
+        let dsh = config_dir.fake_dsh("dsh", "0.1.6-alpha.2");
+
+        settings::save(
+            config_dir.path(),
+            &dsh.display().to_string(),
+            &first.path().display().to_string(),
+        )
+        .expect("the first save succeeds");
+        let mut state = ShellState {
+            config: config::load(config_dir.path()),
+            profiles: Vec::new(),
+            children: BTreeMap::new(),
+            problems: Vec::new(),
+            shell_shown: false,
+        };
+
+        settings::save(
+            config_dir.path(),
+            &dsh.display().to_string(),
+            &second.path().display().to_string(),
+        )
+        .expect("the second save succeeds");
+        adopt_settings(&mut state);
+
+        // What adoption must produce is what a fresh process would see.
+        let fresh = config::load(config_dir.path());
+        assert_eq!(state.config.home, fresh.home);
+        assert_eq!(state.profiles.len(), profile::discover(&fresh.home).0.len());
+        // `DSH_HOME` outranks the file by design, so the literal path is asserted
+        // only in a process with no session override.
+        if std::env::var("DSH_HOME").is_err() {
+            assert_eq!(state.config.home, second.path());
+            assert_eq!(
+                state.profiles.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+                vec!["web"]
+            );
+        }
+    }
+
+    /// The harness window writes nothing into the runtime's page.
+    ///
+    /// This is the invariant the design rests on: the dsh GUI is a standard macOS
+    /// window — system title bar, system traffic lights, system dragging — and the
+    /// page inside it belongs to its authors. An `initialization_script` or an
+    /// `eval` here would quietly turn the shell back into something that patches
+    /// someone else's UI, so both are pinned absent (docs/spec-shell-ux.md §2.5).
+    #[test]
+    fn the_harness_window_writes_nothing_into_its_page() {
+        let source = include_str!("harness_window.rs");
+        assert!(
+            !source.contains("initialization_script"),
+            "the harness window must not inject a script"
+        );
+        assert!(
+            !source.contains(".eval("),
+            "the harness window must not evaluate in its page"
+        );
+        assert!(
+            !source.contains("transparent(") && !source.contains("effects("),
+            "the harness window has no host chrome to make translucent"
+        );
     }
 }

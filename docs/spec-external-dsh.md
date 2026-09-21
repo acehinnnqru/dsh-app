@@ -237,7 +237,7 @@ spawn(path, ["--profile", <name>, "--no-open", "--port", "0"])
 | Q1 | 子进程的 `cwd` 用什么？ | (a) home (b) 不设，用壳的 cwd (c) preset 的 project | 上游语义是"启动不写安装目录"，(a)/(b) 都可能对，但需要一次实测确认 |
 | Q2 | preset 机制是否保留？ | (a) 保留 —— 解析链留第 2 级 (b) 删除 —— 壳只列 `$DSH_HOME/profiles/` | 决定 `preset_store.rs` 与解析链的长度 |
 | Q3 | dev 形态的 home | **dev 与打包态都用同一个 home**：`DSH_HOME` 优先，否则 `$HOME/.dsh`（删除 `DSH_APP_HOME` 与 `.dsh-build/home`）。隔离运行 = `DSH_HOME=$(mktemp -d) dsh-app`。**注意**：第一版实测曾误判"harness 不读 `HOME`"，纠正在 §13 |
-| Q4 | 首启引导做到哪一步？ | (a) 只给 `which dsh` 一行字 (b) 再给一条可复制的安装命令 (c) 壳可以代跑那条命令 | (c) 会让壳重新"做一件事"；这一格是 C1 唯一的缓解手段 |
+| Q4 | 首启引导做到哪一步？ | (a) 只给 `which dsh` 一行字 (b) 再给一条可复制的安装命令 (c) 壳可以代跑那条命令 | (c) 会让壳重新"做一件事"；这一格是 C1 唯一的缓解手段。**Answered** by [spec-shell-ux.md](spec-shell-ux.md) §4: a two-step guide (runtime, then profile) that still runs nothing on the user's behalf |
 
 ---
 
@@ -308,7 +308,7 @@ spawn(path, ["--profile", <name>, "--no-open", "--port", "0"])
 | 4 | `src-tauri/src/lib.rs` | 删 seed/更新/回滚命令与启动分支；改 `start_preset` 的 argv；删 `expose_internals` 与相关 payload 字段 |
 | 5 | `src-tauri/src/preset.rs`、`profile.rs` | 删 `patchReload`/`needs_internals`；`dsh.profile` 只读 `bundles` |
 | 6 | 删除 `runtime_store.rs`、`channel.rs`、`node_probe.rs`、`smoke.rs` | 连同其测试 |
-| 7 | `ui/` | 表单改为两个字段（dsh + harness home）；`nodeSource` → `dshSource`；未配置文案 |
+| 7 | `ui/` | 表单改为两个字段（dsh + harness home）；`nodeSource` → `dshSource`；未配置文案。**Superseded**: the page is now the two-step guide, the flat profile list and the settings sheet of [spec-shell-ux.md](spec-shell-ux.md) |
 | 8 | `flake.nix` | 删 `dshRuntime`/`officialNode`/pnpm 打包；`mkApp` 收敛成唯一的 `dsh-app`；删 `dsh-app-slim`/`dsh-app-bundled`/`default` 三个 package |
 | 9 | `scripts/` | 删 6 个 runtime 脚本 + `prepare-node.mjs`；`package-release.mjs` 去掉变体循环与运行时清单字段 |
 | 10 | `src-tauri/packaging/` | `sign-app.sh`/`export-app.sh` 去掉 `<bundled\|slim>` 参数与 `dsh-app-$variant.app` 命名；删 `entitlements/extract-node-entitlements.sh` |

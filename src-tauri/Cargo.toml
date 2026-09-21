@@ -15,7 +15,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `macos-private-api` is stated here instead of leaving it to the Tauri CLI: this
+# crate is built with plain cargo (see the Nix derivation), and the transparent,
+# vibrancy-backed windows the shell draws need the feature the CLI would otherwise
+# inject from `tauri.conf.json`.
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }

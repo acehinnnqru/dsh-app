@@ -33,6 +33,9 @@ const HEADER: &str = concat!(
     "# home   the harness home it drives; default ~/.dsh.\n",
     "#\n",
     "# Both values are read on every start.\n",
+    "#\n",
+    "# onboarded and profile belong to the first-run guide. They are written by\n",
+    "# the app, and editing them by hand is harmless rather than supported.\n",
 );
 
 /// What the user told us, as stored on disk.
@@ -49,6 +52,16 @@ pub struct Settings {
     /// default: `$HOME/.dsh`, or `DSH_HOME` for one session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
+    /// Whether the first-run guide has been finished on this machine. Absent
+    /// means "not yet": a file written by an older build simply gets the guide
+    /// once, which is the harmless direction to fail in.
+    #[serde(default)]
+    pub onboarded: bool,
+    /// The profile the guide ended on. Purely cosmetic — the launcher sorts it
+    /// first and never starts it on its own — so an unknown name is dropped
+    /// rather than refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The outcome of reading the configuration file.
@@ -63,6 +76,11 @@ pub struct SettingsReport {
     pub path: PathBuf,
     /// Why the file could not be used, when it could not.
     pub problem: Option<String>,
+    /// Whether saving over this file is safe. False for exactly one case: a
+    /// schema this build does not understand, which was written by a *newer*
+    /// shell. A corrupt file is overwritable — replacing it is the fix — but a
+    /// newer one must not be silently downgraded.
+    pub overwritable: bool,
 }
 
 /// The directory the shell keeps its own configuration in.
@@ -107,6 +125,7 @@ pub fn load(dir: &Path) -> SettingsReport {
                 settings: Settings::default(),
                 path,
                 problem: None,
+                overwritable: true,
             }
         }
         Err(error) => {
@@ -114,6 +133,9 @@ pub fn load(dir: &Path) -> SettingsReport {
                 settings: Settings::default(),
                 path: path.clone(),
                 problem: Some(format!("cannot read {}: {error}", path.display())),
+                // A file that cannot be read cannot be respected either, and a
+                // write is the user's only way out of it.
+                overwritable: true,
             }
         }
     };
@@ -129,17 +151,24 @@ pub fn load(dir: &Path) -> SettingsReport {
                 )),
                 _ => None,
             };
-            let settings = if problem.is_some() {
+            let unsupported = problem.is_some();
+            let settings = if unsupported {
                 Settings::default()
             } else {
                 settings
             };
-            SettingsReport { settings, path, problem }
+            SettingsReport {
+                settings,
+                path,
+                problem,
+                overwritable: !unsupported,
+            }
         }
         Err(error) => SettingsReport {
             settings: Settings::default(),
             path: path.clone(),
             problem: Some(format!("cannot parse {}: {error}", path.display())),
+            overwritable: true,
         },
     }
 }
@@ -149,16 +178,65 @@ pub fn load(dir: &Path) -> SettingsReport {
 /// Write a temporary file, then rename over the target, so an interrupted write
 /// can never leave a half-parsed file behind. A blank value is omitted rather
 /// than written empty: absent means the default.
+///
+/// Load-modify-write rather than replace: the guide's own bookkeeping lives in
+/// the same file, so editing the runtime in the settings sheet must not clear
+/// which profile the guide ended on.
 pub fn save(dir: &Path, dsh: &str, home: &str) -> Result<PathBuf, String> {
+    let report = load(dir);
+    refuse_downgrade(&report)?;
+    write(
+        dir,
+        &Settings {
+            schema: Some(SCHEMA),
+            dsh: non_empty(Some(dsh)).map(str::to_owned),
+            home: non_empty(Some(home)).map(str::to_owned),
+            onboarded: report.settings.onboarded,
+            profile: report.settings.profile.clone(),
+        },
+    )
+}
+
+/// Record that the guide finished, and which profile it ended on.
+///
+/// `dsh` and `home` are left exactly as they are: step 1 saves those, and a
+/// second visit only ever adds this bookkeeping. An unknown profile name is
+/// stored as none rather than refused — the launcher tolerates a profile that
+/// disappeared, and a stale name is not worth blocking the guide over.
+pub fn save_onboarding(dir: &Path, profile: Option<&str>) -> Result<PathBuf, String> {
+    let report = load(dir);
+    refuse_downgrade(&report)?;
+    write(
+        dir,
+        &Settings {
+            schema: Some(SCHEMA),
+            onboarded: true,
+            profile: non_empty(profile).map(str::to_owned),
+            ..report.settings
+        },
+    )
+}
+
+/// Refuse to write over a file this build does not understand.
+///
+/// The one irreversible mistake this module could make is downgrading a file
+/// written by a newer shell, so that case — and only that case — blocks a write.
+fn refuse_downgrade(report: &SettingsReport) -> Result<(), String> {
+    if report.overwritable {
+        return Ok(());
+    }
+    Err(format!(
+        "{} was written by a newer dsh-app; refusing to replace it",
+        report.path.display()
+    ))
+}
+
+/// The atomic write itself.
+fn write(dir: &Path, settings: &Settings) -> Result<PathBuf, String> {
     let path = settings_path(dir);
     std::fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
 
-    let settings = Settings {
-        schema: Some(SCHEMA),
-        dsh: non_empty(Some(dsh)).map(str::to_owned),
-        home: non_empty(Some(home)).map(str::to_owned),
-    };
-    let body = toml::to_string(&settings).map_err(|error| error.to_string())?;
+    let body = toml::to_string(settings).map_err(|error| error.to_string())?;
 
     let temporary = dir.join(".config.toml.next");
     std::fs::write(&temporary, format!("{HEADER}{body}"))
@@ -273,5 +351,65 @@ mod tests {
         // The value must not be used *or* overwritten: the user's file is newer
         // than this build's understanding of it.
         assert!(report.settings.dsh.is_none());
+    }
+
+    /// The one irreversible mistake this module could make: replacing a file a
+    /// newer shell wrote.
+    #[test]
+    fn a_newer_file_is_never_overwritten() {
+        let dir = TempDir::new();
+        let path = settings_path(&dir.0);
+        std::fs::write(&path, "schema = 9\ndsh = \"/usr/bin/dsh\"\n").expect("the write succeeds");
+
+        assert!(save(&dir.0, "/usr/bin/other", "").is_err());
+        assert!(save_onboarding(&dir.0, Some("web")).is_err());
+        let text = std::fs::read_to_string(&path).expect("the file is readable");
+        assert!(text.contains("schema = 9"), "the newer file must survive: {text}");
+    }
+
+    /// The guide's bookkeeping lives in the same file as the runtime, so an edit
+    /// to the runtime must not clear it.
+    #[test]
+    fn saving_the_runtime_keeps_the_guides_bookkeeping() {
+        let dir = TempDir::new();
+        save(&dir.0, "/usr/bin/dsh", "~/.dsh").expect("the save succeeds");
+        save_onboarding(&dir.0, Some("web")).expect("the guide finishes");
+
+        save(&dir.0, "/opt/other/dsh", "").expect("the runtime is edited");
+
+        let report = load(&dir.0);
+        assert!(report.problem.is_none(), "{:?}", report.problem);
+        assert_eq!(report.settings.dsh.as_deref(), Some("/opt/other/dsh"));
+        assert!(report.settings.onboarded);
+        assert_eq!(report.settings.profile.as_deref(), Some("web"));
+    }
+
+    /// A file written before the guide existed is an unfinished guide, not a
+    /// problem: the guide runs once and then never again.
+    #[test]
+    fn a_file_without_the_guide_fields_is_not_onboarded() {
+        let dir = TempDir::new();
+        std::fs::write(settings_path(&dir.0), "dsh = \"/usr/bin/dsh\"\n").expect("the write succeeds");
+
+        let report = load(&dir.0);
+        assert!(!report.settings.onboarded);
+        assert!(report.settings.profile.is_none());
+    }
+
+    #[test]
+    fn finishing_the_guide_records_the_profile_and_keeps_the_runtime() {
+        let dir = TempDir::new();
+        save(&dir.0, "/usr/bin/dsh", "~/elsewhere").expect("the save succeeds");
+        save_onboarding(&dir.0, Some("demo")).expect("the guide finishes");
+
+        let report = load(&dir.0);
+        assert!(report.settings.onboarded);
+        assert_eq!(report.settings.profile.as_deref(), Some("demo"));
+        assert_eq!(report.settings.dsh.as_deref(), Some("/usr/bin/dsh"));
+        assert_eq!(report.settings.home.as_deref(), Some("~/elsewhere"));
+
+        // Skipping the profile step is a valid ending, not a failure.
+        save_onboarding(&dir.0, None).expect("the guide finishes without a profile");
+        assert!(load(&dir.0).settings.profile.is_none());
     }
 }
