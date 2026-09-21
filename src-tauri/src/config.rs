@@ -105,12 +105,47 @@ pub fn repo_root() -> PathBuf {
 ///
 /// `DSH_APP_HOME` overrides it, which is what makes an isolated run possible
 /// (`DSH_APP_HOME=$(mktemp -d) dsh-app`) and lets a developer point the shell at
-/// their real `~/.dsh` to share configuration with the CLI. Otherwise the
-/// repository-local default keeps sessions out of the user's own harness home.
+/// their real `~/.dsh` to share configuration with the CLI.
+///
+/// A packaged run never writes next to its own executable: the bundle lives in
+/// `/Applications`, and `repo_root()` cannot tell a bundle there from a
+/// checkout, so mutable state would land in a system directory and a standard
+/// (non-admin) account could not start at all. A run inside a `.app` therefore
+/// uses [`user_data_home`], and only a development checkout keeps the
+/// repository-local default that holds sessions out of the user's own harness
+/// home.
 pub fn resolve_home(root: &Path) -> PathBuf {
     match std::env::var("DSH_APP_HOME") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ if running_in_app_bundle() => user_data_home(),
         _ => root.join(".dsh-build").join("home"),
+    }
+}
+
+/// Whether the executable runs from inside a macOS `.app` bundle.
+///
+/// A bundle path is `<bundle>.app/Contents/MacOS/<exe>`, which is what separates
+/// a packaged run from a checkout's `target/<profile>/<exe>`.
+fn running_in_app_bundle() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    exe.to_string_lossy().contains(".app/Contents/MacOS/")
+}
+
+/// The per-user state directory a packaged app owns.
+///
+/// The macOS convention for mutable application state: writable by the user who
+/// installed the app, untouched by replacing the bundle, and never confused with
+/// the bundle's own (read-only, signed) contents. Falls back to the
+/// repository-local home only when the account has no home directory.
+fn user_data_home() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) if !home.trim().is_empty() => PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("dsh-app"),
+        _ => PathBuf::from(".dsh-build").join("home"),
     }
 }
 
@@ -482,6 +517,36 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn the_environment_override_wins_over_every_default() {
+        // SAFETY: single-threaded test process, and the value is removed again
+        // before the test returns.
+        unsafe { std::env::set_var("DSH_APP_HOME", "/tmp/dsh-app-isolated-home") };
+        assert_eq!(resolve_home(Path::new("/repo")), PathBuf::from("/tmp/dsh-app-isolated-home"));
+        unsafe { std::env::remove_var("DSH_APP_HOME") };
+    }
+
+    #[test]
+    fn a_blank_override_still_means_the_default_home() {
+        // SAFETY: see the test above.
+        unsafe { std::env::set_var("DSH_APP_HOME", "   ") };
+        let home = resolve_home(Path::new("/repo"));
+        unsafe { std::env::remove_var("DSH_APP_HOME") };
+        // The cargo test binary lives under target/, so this is the checkout
+        // default and never the packaged state directory.
+        assert!(home.ends_with(".dsh-build/home"), "{}", home.display());
+    }
+
+    #[test]
+    fn a_development_checkout_keeps_state_inside_the_repository() {
+        if std::env::var("DSH_APP_HOME").is_ok_and(|value| !value.trim().is_empty()) {
+            return;
+        }
+        let home = resolve_home(Path::new("/repo"));
+        // The test binary runs from target/, which is never a `.app` bundle:
+        // the checkout default must stay repository-local.
+        assert_eq!(home, PathBuf::from("/repo/.dsh-build/home"));
+    }
     #[test]
     fn nothing_configured_is_a_state_and_not_an_error() {
         let settings = Settings::default();

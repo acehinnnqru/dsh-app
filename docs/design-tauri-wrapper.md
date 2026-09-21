@@ -958,7 +958,7 @@ dsh web: http://127.0.0.1:45677    ← second（patch 固定的端口）
 
 ### 13.1 两处实现细节（实现时定下来的）
 
-- **`DSH_APP_HOME` 覆盖**：`config.rs` 的 `resolve_home()` 优先读它，否则用仓库内 `.dsh-build/home`。
+- **`DSH_APP_HOME` 覆盖**：`config.rs` 的 `resolve_home()` 优先读它，其余按运行形态分：打包态（可执行文件位于 `<bundle>.app/Contents/MacOS/`）用 `~/Library/Application Support/dsh-app`，开发 checkout 用仓库内 `.dsh-build/home`。
   这是隔离验证（`DSH_APP_HOME=$(mktemp -d)`）与"让开发版读真实 `~/.dsh` 以共享 CLI 配置"两个需求的开关。
 - **preset 目录是整棵树 seed 的，不只是 `.toml`**：`second.toml` 通过 `patches = ["patch.d/fixed-port.yml"]`
   引用**相对自己**的补丁，所以 `patch.d/` 必须一起落到 home。`build.rs` 把 `src-tauri/presets/`
