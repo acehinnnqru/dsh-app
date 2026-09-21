@@ -171,14 +171,26 @@ async function main() {
     }
   })
 
-  const timeout = new Promise((settle) => {
-    const timer = setTimeout(() => settle(new Error(`run-runtime: no readiness line within ${options.timeout}s`)), options.timeout * 1000)
+  // Rejects rather than resolves: a resolved Error would be assigned to `url`
+  // and the real failure would surface later as a TypeError, or not at all.
+  const timeout = new Promise((_resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`run-runtime: no readiness line within ${options.timeout}s`)), options.timeout * 1000)
     timer.unref()
   })
 
+  // A child that dies before readiness is the failure this script exists to
+  // report, so it must be reported as itself. The timer above is unref'ed and
+  // keeps no handle alive, so waiting for it is not merely slower: the process
+  // would end on an "unsettled top-level await" warning with the child's own
+  // stderr never printed.
+  const died = exited.then((outcome) => {
+    throw new Error(`run-runtime: the runtime exited before announcing readiness (code=${outcome.code} signal=${outcome.signal})`)
+  })
+  died.catch(() => {})
+
   let url
   try {
-    url = await Promise.race([readyPromise, timeout])
+    url = await Promise.race([readyPromise, died, timeout])
   } catch (error) {
     child.kill('SIGTERM')
     const detail = stderr.join('').trim().split('\n').slice(-20).join('\n')

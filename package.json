@@ -18,6 +18,7 @@
     "runtime:prepare-node": "node scripts/prepare-node.mjs",
     "runtime:probe": "node scripts/probe-runtime.mjs",
     "runtime:run": "node scripts/run-runtime.mjs",
+    "runtime:trace": "node scripts/trace-runtime.mjs",
     "app:dev": "tauri dev",
     "app:build": "tauri build --bundles app",
     "release:package": "node scripts/package-release.mjs"

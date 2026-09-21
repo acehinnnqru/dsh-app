@@ -48,7 +48,7 @@
 ```
 
 - **写盘纪律**：临时文件 + `rename`；损坏文件按"未配置"处理并显示原因；`schema` 不匹配则拒绝，不静默丢值。
-- **位置风险**：开发态仍是 `<repo>/.dsh-build/home`（被 `.gitignore` 忽略），`git clean -xdf` 或删 checkout 会带走它，而里面是用户手输的绝对路径。**打包态已切到 `~/Library/Application Support/dsh-app`**：原来 `repo_root()` 把 `/Applications/dsh-app.app/...` 反推成 `/Applications`，状态会被写进系统目录，标准（非 admin）账号干脆起不来（Q6 已了结）。
+- **位置风险**：开发态仍是 `<repo>/.dsh-build/home`（被 `.gitignore` 忽略），`git clean -xdf` 或删 checkout 会带走它，而里面是用户手输的绝对路径。**打包态用 `~/.dsh`**（`$HOME/.dsh`，与 CLI 同一个 harness home；壳自己的文件在 `~/.dsh/dsh-app/`）：打包态不看 `repo_root()`，否则 `/Applications/dsh-app.app/...` 会被反推成 `/Applications`，状态写进系统目录，标准（非 admin）账号干脆起不来（Q6 已了结）。
 
 ---
 
@@ -129,7 +129,7 @@ shell_state                          -> 增加 configured: bool 与已保存路�
 | Q3 | bundled 里覆盖 Node 后 pnpm 用谁？ | 各管各的；机制见 §4 |
 | Q4 | settings 与 preset 谁优先？ | **preset 覆盖 settings**（更具体的作用域赢） |
 | Q5 | 版本不在区间拦不拦？ | **不拦，只警告** |
-| Q6 | settings 存哪？ | `<app home>/dsh-app/settings.json`；打包态 app home 是 `~/Library/Application Support/dsh-app`，开发态仍为 `<repo>/.dsh-build/home` |
+| Q6 | settings 存哪？ | `<app home>/dsh-app/settings.json`；打包态 app home 是 `~/.dsh`（与 CLI 共享的 harness home），开发态为 `<repo>/.dsh-build/home` |
 
 ---
 

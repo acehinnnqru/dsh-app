@@ -111,9 +111,10 @@ pub fn repo_root() -> PathBuf {
 /// `/Applications`, and `repo_root()` cannot tell a bundle there from a
 /// checkout, so mutable state would land in a system directory and a standard
 /// (non-admin) account could not start at all. A run inside a `.app` therefore
-/// uses [`user_data_home`], and only a development checkout keeps the
-/// repository-local default that holds sessions out of the user's own harness
-/// home.
+/// uses [`user_data_home`] — the user's own harness home, so the GUI and the
+/// `dsh` CLI read and write the same sessions, settings, and credentials. Only
+/// a development checkout keeps the repository-local default, which holds its
+/// sessions out of the user's harness home.
 pub fn resolve_home(root: &Path) -> PathBuf {
     match std::env::var("DSH_APP_HOME") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
@@ -133,20 +134,31 @@ fn running_in_app_bundle() -> bool {
     exe.to_string_lossy().contains(".app/Contents/MacOS/")
 }
 
-/// The per-user state directory a packaged app owns.
+/// The state directory a packaged app owns: the user's harness home, `~/.dsh`.
 ///
-/// The macOS convention for mutable application state: writable by the user who
-/// installed the app, untouched by replacing the bundle, and never confused with
-/// the bundle's own (read-only, signed) contents. Falls back to the
-/// repository-local home only when the account has no home directory.
+/// Deliberately the harness's own home rather than a directory of the shell's
+/// own (`~/Library/Application Support/dsh-app`, which is where this started):
+/// the GUI is a second front end for the same product data, so a session,
+/// setting, or credential the user created in one front end has to be there in
+/// the other. Everything the shell owns stays in the `dsh-app/` subtree
+/// (`settings::APP_DIR`) and never in the harness home's other entries — which
+/// is also what lets an uninstall remove the app without touching a session.
+///
+/// Falls back to the repository-local home only when the account has no home
+/// directory.
 fn user_data_home() -> PathBuf {
     match std::env::var("HOME") {
-        Ok(home) if !home.trim().is_empty() => PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("dsh-app"),
+        Ok(home) if !home.trim().is_empty() => packaged_home(Path::new(&home)),
         _ => PathBuf::from(".dsh-build").join("home"),
     }
+}
+
+/// Where a packaged run keeps its state inside one user's home directory.
+///
+/// Split out from [`user_data_home`] so the shape can be asserted without
+/// mutating `HOME`, which this test process shares with every other test.
+fn packaged_home(user_home: &Path) -> PathBuf {
+    user_home.join(".dsh")
 }
 
 /// Resolve the shell's configuration.
@@ -547,6 +559,15 @@ mod tests {
         // the checkout default must stay repository-local.
         assert_eq!(home, PathBuf::from("/repo/.dsh-build/home"));
     }
+
+    #[test]
+    fn a_packaged_run_uses_the_users_harness_home() {
+        // `~/.dsh` is the harness's own default home, so the packaged shell
+        // shares sessions and credentials with the CLI instead of keeping a
+        // private copy under `Library/Application Support`.
+        assert_eq!(packaged_home(Path::new("/Users/someone")), PathBuf::from("/Users/someone/.dsh"));
+    }
+
     #[test]
     fn nothing_configured_is_a_state_and_not_an_error() {
         let settings = Settings::default();

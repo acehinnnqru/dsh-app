@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "//": "Packages this app deliberately does not ship. Applied by scripts/prepare-runtime.mjs as a pnpm override removal, so an entry keeps the package out of the closure entirely; 'pnpm runtime:trace' reports what a boot actually loads. Every entry must say why it is omitted and what stops working without it, and '--full' fails if an entry no longer matches anything.",
+  "omit": [
+    {
+      "name": "@deepseek-ai/libreoffice-kit-darwin-arm64",
+      "why": "255 MB of the 546 MB closure for one tool. The engine is an optionalDependency of @deepseek-ai/libreoffice-kit and is resolved lazily (require.resolve inside createConverter), so nothing else in the closure references it.",
+      "effect": "Office to PDF conversion fails when it is used: 'Required LibreOfficeKit native package is missing: @deepseek-ai/libreoffice-kit-darwin-arm64'. Everything else, including starting the shell and loading the office plugin, is unaffected."
+    }
+  ]
+}

@@ -311,10 +311,11 @@ job: "run the tests"      # 仅 kind=task：位置参数（上游 `dsh --profile
 **布局**：
 
 ```
-$DSH_HOME/                                 （默认 ~/.dsh，与 CLI 共享的顶层）
-├── .credentials.yaml                      ← CLI 的凭据（不归 dsh-app 管）
-├── profiles/…                             ← CLI 自己的 profile（不归 dsh-app 管）
-└── dsh-app/
+$DSH_HOME/                                 （默认 ~/.dsh；壳与 CLI 共用，子进程的 DSH_HOME 就是它）
+├── .credentials.yaml                      ← 共享的凭据（GUI 与 CLI 同一份）
+├── settings.yaml、sessions/、storages/…    ← 共享的产品数据
+├── profiles/…                             ← CLI 的 profile 与 GUI 的 preset profile 并存
+└── dsh-app/                               ← 只属于 dsh-app；卸载时唯一可以删的子树
     ├── runtimes/
     │   ├── current -> 0.1.5-rc.1/         ← 原子替换的符号链接 = 活动版本
     │   ├── prev/                          ← 上一次成功激活的版本（唯一回滚点，D8.2 U4）
@@ -325,9 +326,6 @@ $DSH_HOME/                                 （默认 ~/.dsh，与 CLI 共享的�
     ├── node/darwin-arm64/<ver>/           ← Node 安装（更新时复用，不重复下载）
     ├── pnpm/                              ← 内置 pnpm（插件管理用）
     ├── presets/<id>.yaml                  ← 用户 preset（D3）
-    ├── home/                              ← 子进程的 DSH_HOME
-    │   ├── profiles/<preset 的 profile>/  （会话、设置在这里）
-    │   └── .credentials.yaml
     └── state.json                         ← 通道、当前版本、上次成功启动、各 preset 崩溃计数
 ```
 
@@ -336,13 +334,13 @@ $DSH_HOME/                                 （默认 ~/.dsh，与 CLI 共享的�
 | 上一版（多版本并存） | 现在（一次安装一版本） |
 |---|---|
 | `runtimes/<channel>-<ver>/` 多份并存 | `runtimes/current` 单份 + `prev/` 回滚点 |
-| 每个运行时一个 `homes/<runtime-id>/` | **单一 `home/`**，所有 preset 共享 |
+| 每个运行时一个 `homes/<runtime-id>/` | **单一 `$DSH_HOME`**，所有 preset 共享，CLI 也用这一个 |
 | 跨版本不共享会话/凭据（要写导入向导） | **天然共享**：切版本后会话、设置、凭据都在（Q4 消失） |
 | 需要运行时选择 UI + 一致性校验 | 不需要：只有一个后端版本 |
 
-**一个 `home/` 是更好的产品语义**：用户视角里"我的会话和配置"属于这个应用，不属于某个后端版本。上游 Electron 之所以要独立 home，是因为它要和**同时存在的 CLI** 隔离可执行包；我们和 CLI 的边界同样是"可执行包在 app 内、产品数据在 home"，但因为我们不再需要多版本并存，所以不需要为它再切一层目录。
+**一个 home 是更好的产品语义**：用户视角里"我的会话和配置"属于这个产品，不属于某个后端版本，也不属于某一个前端。上游 Electron 之所以要独立 home，是因为它要和**同时存在的 CLI** 隔离可执行包；我们和 CLI 的边界同样是"可执行包各在自己的安装里、产品数据在同一个 home"，但因为我们不再需要多版本并存，所以不需要为它再切一层目录。
 
-**与 CLI 的关系**：`home/` 是 dsh-app 私有的 `$DSH_HOME`，因此 `dsh --profile <name>` 默认**看不到** GUI 的会话。若用户希望共享，提供一个显式设置"使用 `~/.dsh` 作为 home"（v1 建议默认私有，并在设置页说明差异，而不是默认共享——默认共享会让"GUI 与 CLI 同时跑不同版本"重新变成可能，正是我们要避开的）。
+**与 CLI 的关系**：打包态的 home 就是 `~/.dsh`，所以 `dsh --profile <name>` 与 GUI 的 preset 看到的是同一份会话、设置和凭据——登录一次两边都可用，这是"同一个产品的两个前端"应有的行为（Q5）。代价是 GUI 与 CLI 可能各带一个 dsh 安装对着同一个 `$DSH_HOME/profiles/node_modules` 回退，也就是上面那条上游约束；0.1.6 起 CLI 默认走进程内 runtime 解析，不再每次启动改写那张符号链接表，互剪的根因因此消失。需要完全隔离时用 `DSH_APP_HOME=$(mktemp -d)` 起一个独立的壳。
 
 **Node 复用**：原生模块只按 `os`/`cpu` 分发（Node-API/NAPI，不按 Node 主版本；`@deepseek-ai/node-addon-system` 的 optionalDependencies 只有 `-darwin-arm64` / `-darwin-x64` / `-linux-*`），所以更新 dsh 版本时**通常不需要换 Node**。`node/darwin-arm64/<ver>/` 支持并存多个 Node 版本，`node ->` 链接按清单选择；更新时若新运行时的 `node.requirement` 不满足当前 Node，才下载第二份。
 
@@ -590,7 +588,8 @@ cask "dsh-app" do
   url "https://github.com/acehinnnqru/dsh-app/releases/download/v#{version}/dsh-app-#{version}-#{arch}.dmg"
   name "DeepSeek Harness"
   app "dsh-app.app"
-  zap trash: ["~/Library/Application Support/dsh-app"]
+  # 只删壳自己的子树；~/.dsh 本身是用户的 harness home，里面有会话，绝不能整棵删
+  zap trash: ["~/.dsh/dsh-app"]
 end
 ```
 
@@ -813,7 +812,7 @@ macos-14 / macos-13 两个 runner（arm64 / x64）
 | Q2 | slim 变体是否也发 dmg（体积小）还是只发 tarball？ | brew formula 的实现方式 | 待定 |
 | Q3 | 是否要向上游提一个 `dsh-app` 专用的 reserved profile 名（避免与 CLI 撞名） | 生态一致性 | 待定，可与上游沟通 |
 | **Q4** | **多 preset 同时跑**：v1 是否就允许（UI 只有单活动窗口），还是先限制为"一次一个"？ | 决定 supervisor 与并发不变量的实现时机 | 待评审：架构按"可并发"设计（D3.2/D3.4），但 v1 可以先只暴露单活动 |
-| **Q5** | GUI 的 `home/` 是否要提供"改用 `~/.dsh`"开关（与 CLI 共享会话） | 影响与 CLI 的协作体验 | 待评审：默认私有；开了就等于允许 GUI 与 CLI 跑不同版本（D7） |
+| **Q5** | GUI 的 home 是否与 CLI 共享 | 影响与 CLI 的协作体验 | **已定：打包态直接用 `~/.dsh`**（D7），不另设开关——GUI 与 CLI 是同一产品的两个前端，共享会话与凭据才是默认语义；要隔离用 `DSH_APP_HOME` |
 | **Q6** | 更新检查是自动（启动时静默检查）还是纯手动？ | 影响网络行为与隐私观感 | 待评审：建议启动后延迟检查 + 只提示不自动装 |
 
 ---
@@ -958,8 +957,8 @@ dsh web: http://127.0.0.1:45677    ← second（patch 固定的端口）
 
 ### 13.1 两处实现细节（实现时定下来的）
 
-- **`DSH_APP_HOME` 覆盖**：`config.rs` 的 `resolve_home()` 优先读它，其余按运行形态分：打包态（可执行文件位于 `<bundle>.app/Contents/MacOS/`）用 `~/Library/Application Support/dsh-app`，开发 checkout 用仓库内 `.dsh-build/home`。
-  这是隔离验证（`DSH_APP_HOME=$(mktemp -d)`）与"让开发版读真实 `~/.dsh` 以共享 CLI 配置"两个需求的开关。
+- **`DSH_APP_HOME` 覆盖**：`config.rs` 的 `resolve_home()` 优先读它，其余按运行形态分：打包态（可执行文件位于 `<bundle>.app/Contents/MacOS/`）用 `~/.dsh`，开发 checkout 用仓库内 `.dsh-build/home`。
+  这是隔离验证（`DSH_APP_HOME=$(mktemp -d)`）的开关；打包态本身就是用户的 harness home，GUI 与 CLI 直接共享产品数据（D7/Q5）。
 - **preset 目录是整棵树 seed 的，不只是 `.toml`**：`second.toml` 通过 `patches = ["patch.d/fixed-port.yml"]`
   引用**相对自己**的补丁，所以 `patch.d/` 必须一起落到 home。`build.rs` 把 `src-tauri/presets/`
   拷进 `OUT_DIR/seed-presets/`（编译期常量路径——从可执行文件上溯推路径在 `target/<profile>/` 与
@@ -1359,6 +1358,27 @@ Mach-O 判定，这样新增一个原生依赖不会静默漏签（漏签的后�
 - **`libiconv` 的修法是针对这一个库的**（唯一一个非系统依赖）。若将来新增依赖引入别的
   store 库，`installPhase` 里的断言会失败并打印清单，而不是静默产出跑不起来的包。
 
+
+## 20. 闭包裁剪：显式策略 + 运行期证据
+
+**背景**：bundled 变体 705 MB = 种子闭包 546 MB + Node 131 MB + pnpm 20 MB + 壳 7.5 MB。闭包由 `pnpm deploy --prod @deepseek-ai/dsh` 决定，所以它带着 harness 发布的**每一个**插件包（496 个包里 249 个是 `@deepseek-ai/dsh-*` 插件，但它们的 JS 加起来只有约 50 MB）；"这次启动实际加载哪些"是运行期由 profile bundles 决定的。
+
+**为什么不能自动最小化**：实测（0.1.6-alpha.2，对闭包内全部 JS 做 `import`/`require` BFS，入口 `@deepseek-ai/dsh` + `dsh-base` + `dsh-web-app`）——**471 个包里只有 54 个静态可达（12.7 MB）**。因为 harness 的 bundle/插件是按名字在运行期解析加载的（`@deepseek-ai/dsh-app-boot` 的模板表），`@deepseek-ai/dsh-web-frontend` 甚至是 `dsh-web-app` 的声明依赖却从不被 import。静态图在这里既会误删功能、又会漏掉依赖，**不能当作裁剪依据**。
+
+**三条腿**：
+
+1. **证据**：`pnpm runtime:trace`（[scripts/trace-runtime.mjs](scripts/trace-runtime.mjs) + [scripts/lib/module-trace.mjs](scripts/lib/module-trace.mjs)）用 `node --import` 注入 `registerHooks`，把 runtime 的每次模块解析写成 `.dsh-build/module-trace.jsonl`，并给出"启动加载了哪些包 / 从未加载哪些包（含大小）"。
+   - 子进程仍由 `run-runtime.mjs` 拉起，argv 与环境（`DSH_*`/`npm_*`/`NODE_OPTIONS` 被剥掉）与壳给子进程的一致；`MODULE_TRACE_LOG` 刻意不用 `DSH_*` 名字，否则会被那层过滤掉。
+   - 首次实测（`--profile web`，与 app 默认 preset 同一组 bundles）：**1126 次解析、268 个包被加载（74.7 MB）、203 个包从未加载（403.0 MB）**。
+   - **"从未加载"不等于"可以删"**：node-pty（终端）、ripgrep（搜索）、sharp（图片）、MCP/ACP、其它厂商 SDK 全在这一列——它们是**懒加载的功能**。报告是证据，不是判决；每条裁剪都要由 `effect` 说明代价。
+2. **策略**：[runtime-omit.json](runtime-omit.json)，每条必须写 `name` + `why` + `effect`（去掉后什么功能、在什么时候、报什么错）。`scripts/prepare-runtime.mjs` 把它写成 staging `pnpm-workspace.yaml` 的 `overrides: {'<pkg>': '-'}`，包**根本不进闭包**（连同它的私有依赖一起不下载）。`runtime.json` 记录 `omitted`，诊断因此能说"这个构建没有 X"。
+   - 坑：pnpm 11 **不再读** `package.json` 里的 `pnpm.overrides`（只打 WARN），必须写在 `pnpm-workspace.yaml`。
+3. **两道门**：
+   - **静态引用扫描**：裁完后扫描保留的文件，出现 `from "X"` / `require("X")` / `import("X")` 就构建失败。算出来的说明符（`require.resolve(\`${prefix}-${target}/package.json\`)`）**不算**——肯这么写的就是设计成可选的包，那类由 trace + 冒烟负责。
+   - **陈旧条目**：`--full`（不套策略）是唯一还能看见被裁包的构建，所以由它断言"清单里每个名字确实存在"；否则上游改名/移除后，清单会烂掉却照样发字节。裁过的构建反过来断言"确实不在"。
+   - 运行期依旧走 `runtime:probe` 与壳的种子冒烟。
+
+**首批条目**：`@deepseek-ai/libreoffice-kit-darwin-arm64`（255 MB）。它是 `@deepseek-ai/libreoffice-kit` 的 optionalDependency，由 `createConverter` 内部 `require.resolve` 惰性解析，闭包里没有第二处引用；代价只有 office→PDF 在用时报 `Required LibreOfficeKit native package is missing`。
 
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 
