@@ -1,37 +1,49 @@
-//! Materialize a preset's profile on first boot, and read the profiles that
-//! already exist.
+//! The profiles the launcher can start.
 //!
-//! dsh-app writes the profile itself rather than invoking `dsh plugin`, which
-//! forwards to PATH `pnpm` and would make first boot depend on a package manager
-//! being resolvable. The shapes mirror the harness `initProfile` output
-//! (`@deepseek-ai/dsh-app-boot`).
+//! A profile the `dsh` CLI created is already a complete launch configuration, so
+//! the launcher lists it as it is rather than asking the user to restate it. The
+//! shell writes no profile of its own and materializes nothing: creating a profile
+//! stays with the harness and the user (design doc §21, §22).
 //!
-//! Discovery is the mirror image: a profile the `dsh` CLI created is already a
-//! complete launch configuration, so the launcher lists it as it is rather than
-//! asking the user to restate it as a preset.
-//!
-//! @see docs/design-tauri-wrapper.md D3, §11.5, §21
+//! @see docs/design-tauri-wrapper.md §21, §22
+//! @see docs/spec-external-dsh.md D4
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::preset::Preset;
-use crate::profile_template;
-
 /// Directory under a harness home holding every profile.
 pub const PROFILES_DIR: &str = "profiles";
 
-/// The profile directory for one preset under a harness home.
-pub fn profile_dir(home: &Path, preset: &Preset) -> PathBuf {
-    home.join(PROFILES_DIR).join(preset.profile_name())
+/// The bundle that gives a profile a served web GUI, and therefore the only
+/// carrier this shell implements.
+pub const WEB_BUNDLE: &str = "@deepseek-ai/dsh-web-app";
+/// The one-shot task carrier.
+pub const HEADLESS_BUNDLE: &str = "@deepseek-ai/dsh-headless";
+/// The stdio carriers (upstream `acp` and `sdk` templates).
+pub const ACP_BUNDLE: &str = "@deepseek-ai/dsh-acp-app";
+pub const SDK_BUNDLE: &str = "@deepseek-ai/dsh-sdk-app";
+pub const SDK_MINIMAL_BUNDLE: &str = "@deepseek-ai/dsh-sdk-minimal";
+
+/// The carrier a bundle stack implies, for a profile the shell did not create.
+///
+/// A profile does not state a `kind`: its bundles are the only statement of what
+/// it can be launched as. Web wins when several carriers are present, because the
+/// shell can only drive that one (design doc D3.3).
+pub fn kind_for_bundles(bundles: &[String]) -> &'static str {
+    let has = |wanted: &str| bundles.iter().any(|bundle| bundle == wanted);
+    if has(WEB_BUNDLE) {
+        "web"
+    } else if has(HEADLESS_BUNDLE) {
+        "task"
+    } else if has(ACP_BUNDLE) || has(SDK_BUNDLE) || has(SDK_MINIMAL_BUNDLE) {
+        "server"
+    } else {
+        "none"
+    }
 }
 
 /// A profile that exists on disk, as its own manifest declares it.
-///
-/// The shell reads the profile's statement about itself instead of inventing
-/// one: `bundles` decides which carrier it can be launched as, and
-/// `patchReload` decides whether it needs internals access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredProfile {
     /// Directory name, which is the `--profile` argument.
@@ -40,27 +52,6 @@ pub struct DiscoveredProfile {
     pub dir: PathBuf,
     /// `dsh.profile.bundles`, in order.
     pub bundles: Vec<String>,
-    /// `dsh.profile.patchReload`, when the profile declares one.
-    pub patch_reload: Option<String>,
-}
-
-/// `package.json`'s `dsh.profile` section, as far as the shell reads it.
-#[derive(Debug, Deserialize)]
-struct ProfileManifest {
-    dsh: Option<ProfileSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProfileSection {
-    profile: Option<ProfileDeclaration>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProfileDeclaration {
-    #[serde(default)]
-    bundles: Option<Vec<String>>,
-    #[serde(default, rename = "patchReload")]
-    patch_reload: Option<String>,
 }
 
 /// Read every materialized profile under `<home>/profiles`.
@@ -104,7 +95,6 @@ pub fn discover(home: &Path) -> (Vec<DiscoveredProfile>, Vec<String>) {
                 name,
                 dir: path,
                 bundles: declaration.bundles.unwrap_or_default(),
-                patch_reload: declaration.patch_reload,
             }),
             Ok(None) => problems.push(format!(
                 "{} declares no dsh.profile section, so it is not a profile the launcher can start",
@@ -117,6 +107,23 @@ pub fn discover(home: &Path) -> (Vec<DiscoveredProfile>, Vec<String>) {
     (profiles, problems)
 }
 
+/// `package.json`'s `dsh.profile` section, as far as the shell reads it.
+#[derive(Debug, Deserialize)]
+struct ProfileManifest {
+    dsh: Option<ProfileSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileSection {
+    profile: Option<ProfileDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileDeclaration {
+    #[serde(default)]
+    bundles: Option<Vec<String>>,
+}
+
 /// Read one profile manifest's declaration, or `Ok(None)` when it has none.
 fn read_declaration(manifest: &Path) -> Result<Option<ProfileDeclaration>, String> {
     let text = std::fs::read_to_string(manifest)
@@ -124,62 +131,6 @@ fn read_declaration(manifest: &Path) -> Result<Option<ProfileDeclaration>, Strin
     let parsed: ProfileManifest = serde_json::from_str(&text)
         .map_err(|error| format!("cannot parse {}: {error}", manifest.display()))?;
     Ok(parsed.dsh.and_then(|section| section.profile))
-}
-
-/// Whether the profile already exists (any of its owned files present).
-pub fn is_materialized(dir: &Path) -> bool {
-    dir.join("package.json").is_file()
-}
-
-/// Result of one materialization attempt.
-pub struct MaterializeReport {
-    pub dir: PathBuf,
-    pub created: bool,
-}
-
-/// Create the profile manifest, empty user patch layer, and pnpm settings.
-///
-/// Existing files are never touched, matching upstream's `initProfile`, so this
-/// is a no-op on an initialized profile and user edits survive.
-pub fn materialize(home: &Path, preset: &Preset) -> Result<MaterializeReport, String> {
-    let dir = profile_dir(home, preset);
-    let existed = is_materialized(&dir);
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("cannot create profile {}: {error}", dir.display()))?;
-
-    let manifest_path = dir.join("package.json");
-    if !manifest_path.exists() {
-        let manifest = serde_json::json!({
-            "name": format!("dsh-profile-{}", preset.profile_name()),
-            "private": true,
-            "dependencies": {},
-            "dsh": {
-                "profile": {
-                    "bundles": preset.bundle_list(),
-                    "patchReload": preset.patch_reload_value(),
-                }
-            }
-        });
-        let text = format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?);
-        write_new(&manifest_path, &text)?;
-    }
-
-    let patch_path = dir.join("cordis.patch.yml");
-    if !patch_path.exists() {
-        write_new(&patch_path, profile_template::PROFILE_PATCH_TEMPLATE)?;
-    }
-
-    let workspace_path = dir.join("pnpm-workspace.yaml");
-    if !workspace_path.exists() {
-        write_new(&workspace_path, profile_template::PROFILE_PNPM_WORKSPACE)?;
-    }
-
-    Ok(MaterializeReport { dir, created: !existed })
-}
-
-/// Write a file only when it does not exist yet.
-fn write_new(path: &Path, contents: &str) -> Result<(), String> {
-    std::fs::write(path, contents).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -221,6 +172,10 @@ mod tests {
       "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"], "patchReload": "live" } }
     }"#;
 
+    fn bundles(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
     #[test]
     fn a_profile_is_read_from_its_own_manifest() {
         let home = TempHome::new("discover-read");
@@ -235,7 +190,9 @@ mod tests {
             profiles[0].bundles,
             ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
         );
-        assert_eq!(profiles[0].patch_reload.as_deref(), Some("live"));
+        // The profile's own reload mode is its business: the shell reads bundles
+        // to classify the carrier and nothing else (spec D8).
+        assert_eq!(kind_for_bundles(&profiles[0].bundles), "web");
     }
 
     /// A manifest without `dsh.profile` is a real directory the user can see in
@@ -295,5 +252,21 @@ mod tests {
         let (profiles, problems) = discover(home.path());
         assert!(profiles.is_empty());
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// A discovered profile has no `kind` of its own, so its bundles are the
+    /// only statement of what the launcher can do with it (design doc D3.3).
+    #[test]
+    fn a_profile_is_classified_by_its_bundles() {
+        assert_eq!(kind_for_bundles(&bundles(&["@deepseek-ai/dsh-base", WEB_BUNDLE])), "web");
+        assert_eq!(kind_for_bundles(&bundles(&["@deepseek-ai/dsh-base", HEADLESS_BUNDLE])), "task");
+        assert_eq!(kind_for_bundles(&bundles(&["@deepseek-ai/dsh-base", ACP_BUNDLE])), "server");
+        assert_eq!(kind_for_bundles(&bundles(&[SDK_BUNDLE])), "server");
+        assert_eq!(kind_for_bundles(&bundles(&[SDK_MINIMAL_BUNDLE])), "server");
+        // The one carrier this shell can drive wins over the others.
+        assert_eq!(kind_for_bundles(&bundles(&[HEADLESS_BUNDLE, WEB_BUNDLE])), "web");
+        // A bare installation layer is not a carrier at all.
+        assert_eq!(kind_for_bundles(&bundles(&["@deepseek-ai/dsh-base"])), "none");
+        assert_eq!(kind_for_bundles(&[]), "none");
     }
 }

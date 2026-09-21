@@ -3,8 +3,7 @@
 # Assemble a macOS `.app` around an already-built shell binary.
 #
 # Shared by local packaging and the Nix derivation on purpose: the bundle layout
-# is a contract (the shell resolves its seed from `Contents/Resources/runtimes`)
-# and having two copies of it would let them drift.
+# is a contract, and having two copies of it would let them drift.
 #
 # Note what this does NOT do: it never calls `tauri build`. That would run the
 # frontend toolchain, which this project deliberately does not need — the shell
@@ -12,7 +11,7 @@
 # derivation therefore builds the crate and assembles the bundle here.
 #
 # Usage:
-#   assemble-app.sh --binary <path> --out <dir> [--seed <runtime-dir>] [--version <v>]
+#   assemble-app.sh --binary <path> --out <dir> [--version <v>]
 #
 # The result is unsigned. Signing is a separate, documented step because it needs
 # credentials and cannot be deterministic (design doc §7.2).
@@ -21,7 +20,6 @@ set -euo pipefail
 
 binary=""
 out=""
-seed=""
 version="0.0.0"
 # The bundle identifier is a signing input — it becomes part of the designated
 # requirement — so it is declared rather than defaulted silently, and
@@ -32,7 +30,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --binary) binary="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
-    --seed) seed="$2"; shift 2 ;;
     --version) version="$2"; shift 2 ;;
     --bundle-id) bundle_id="$2"; shift 2 ;;
     *) echo "assemble-app: unknown argument $1" >&2; exit 2 ;;
@@ -58,27 +55,6 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 echo "assemble-app: $app"
 install -m 755 "$binary" "$app/Contents/MacOS/dsh-app"
-
-# Sample presets, seeded into the shell's home on first run.
-if [ -d "$crate/presets" ]; then
-  mkdir -p "$app/Contents/Resources/presets"
-  cp -R "$crate/presets/." "$app/Contents/Resources/presets/"
-fi
-
-# The runtime seed. Absent in a development build, where the shell reads
-# `.dsh-build/runtimes` instead; present in a shipped bundle so first run works
-# offline (design doc D8.2 U3).
-if [ -n "$seed" ]; then
-  [ -f "$seed/runtime.json" ] || { echo "assemble-app: $seed is not a runtime (no runtime.json)" >&2; exit 2; }
-  # The directory name becomes the installed version id, so it must agree with
-  # the manifest rather than with whatever the caller's directory happened to be
-  # called (a build directory is `seed`, a store path is a hash).
-  name="$(sed -n 's/.*"dshVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$seed/runtime.json" | head -n1)"
-  [ -n "$name" ] || { echo "assemble-app: $seed/runtime.json has no dshVersion" >&2; exit 2; }
-  echo "assemble-app: seed runtime $name"
-  mkdir -p "$app/Contents/Resources/runtimes/$name"
-  cp -R "$seed/." "$app/Contents/Resources/runtimes/$name/"
-fi
 
 # The icon, when one has been generated.
 if [ -f "$crate/icons/icon.icns" ]; then

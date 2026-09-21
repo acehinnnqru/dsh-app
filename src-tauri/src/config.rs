@@ -1,669 +1,440 @@
-//! Launch configuration.
+//! The shell's home, and the `dsh` executable it launches.
 //!
-//! The packaged app will read presets from `$DSH_HOME/dsh-app/presets/`; during
-//! development the same shape is read from a repository-local file so the shell
-//! can be exercised before the runtime store (M5) exists.
+//! The shell ships no runtime of its own: it supervises an executable the user
+//! names, so "which dsh" is the only resolution left, and it has exactly two
+//! sources — one session, or this machine's settings file.
 //!
-//! @see docs/design-tauri-wrapper.md D3 (preset), D7 (runtime layout)
+//! @see docs/spec-external-dsh.md §2, §3, §5
 
 use std::path::{Path, PathBuf};
 
-use crate::runtime_store::RuntimeStore;
-use crate::settings::Settings;
+use serde::Serialize;
 
-use serde::{Deserialize, Serialize};
+use crate::settings::{self, Settings};
 
-/// A resolved runtime layout on disk.
-///
-/// Deliberately no longer carries a Node: resolution needs the settings file
-/// (`slim` carries no Node at all), so it is done explicitly by the callers that
-/// know which context they are in — global startup, or one preset.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RuntimeConfig {
-    /// Directory holding `runtime.json`, `package.json`, `node_modules/`.
-    pub dir: PathBuf,
-}
-
-/// The launch plan the shell needs: where state lives and which runtime to use.
+/// Where the shell keeps state and which dsh it will launch.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppConfig {
-    /// Where dsh-app keeps its own state (`DSH_HOME` for the child).
+    /// The harness home the shell drives: where profiles come from, the child's
+    /// working directory, and the value it is told as `DSH_HOME`.
     pub home: PathBuf,
-    /// The selected runtime.
-    pub runtime: RuntimeConfig,
+    /// Where the shell keeps its own configuration. Its own directory, not the
+    /// home it drives, so that a configured home can never relocate the file
+    /// that configures it.
+    pub config_dir: PathBuf,
     /// Problems found while loading settings, surfaced in the UI. A corrupt
     /// settings file never stops the shell: it means "unconfigured".
     pub settings_problems: Vec<String>,
 }
 
-/// `runtime.json` as written by `scripts/prepare-runtime.mjs`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeManifest {
-    pub schema: u32,
-    pub channel: String,
-    #[serde(rename = "dshVersion")]
-    pub dsh_version: String,
-    pub platform: String,
-    pub entry: RuntimeEntry,
-    pub node: RuntimeNode,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeEntry {
-    pub kind: String,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeNode {
-    pub requirement: String,
-}
-
-impl RuntimeManifest {
-    /// Read and validate `<dir>/runtime.json`.
-    pub fn load(dir: &Path) -> Result<Self, String> {
-        let path = dir.join("runtime.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&text)
-            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-        if manifest.schema != 1 {
-            return Err(format!(
-                "{}: unsupported runtime.json schema {}",
-                path.display(),
-                manifest.schema
-            ));
-        }
-        Ok(manifest)
-    }
-
-    /// Absolute path of the launcher entry inside the closure.
-    pub fn entry_path(&self, dir: &Path) -> PathBuf {
-        dir.join(&self.entry.path)
-    }
-}
-
-/// The repository root, derived from the built binary's location so the shell
-/// works both from `target/debug` and from a bundle.
-pub fn repo_root() -> PathBuf {
-    // src-tauri/target/<profile>/dsh-app -> repo root is four levels up.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let mut candidate = exe.as_path();
-    for _ in 0..4 {
-        if let Some(parent) = candidate.parent() {
-            candidate = parent;
-        }
-    }
-    candidate.to_path_buf()
-}
-
-/// The shell's home: where its presets and the runtime's `DSH_HOME` live.
-///
-/// Public because startup needs it before any configuration can be loaded: the
-/// runtime store lives here, and the store is what the configuration is built
-/// from.
-///
-/// `DSH_APP_HOME` overrides it, which is what makes an isolated run possible
-/// (`DSH_APP_HOME=$(mktemp -d) dsh-app`) and lets a developer point the shell at
-/// their real `~/.dsh` to share configuration with the CLI.
-///
-/// A packaged run never writes next to its own executable: the bundle lives in
-/// `/Applications`, and `repo_root()` cannot tell a bundle there from a
-/// checkout, so mutable state would land in a system directory and a standard
-/// (non-admin) account could not start at all. A run inside a `.app` therefore
-/// uses [`user_data_home`] — the user's own harness home, so the GUI and the
-/// `dsh` CLI read and write the same sessions, settings, and credentials. Only
-/// a development checkout keeps the repository-local default, which holds its
-/// sessions out of the user's harness home.
-pub fn resolve_home(root: &Path) -> PathBuf {
-    match std::env::var("DSH_APP_HOME") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ if running_in_app_bundle() => user_data_home(),
-        _ => root.join(".dsh-build").join("home"),
-    }
-}
-
-/// Whether the executable runs from inside a macOS `.app` bundle.
-///
-/// A bundle path is `<bundle>.app/Contents/MacOS/<exe>`, which is what separates
-/// a packaged run from a checkout's `target/<profile>/<exe>`.
-fn running_in_app_bundle() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    exe.to_string_lossy().contains(".app/Contents/MacOS/")
-}
-
-/// The state directory a packaged app owns: the user's harness home, `~/.dsh`.
-///
-/// Deliberately the harness's own home rather than a directory of the shell's
-/// own (`~/Library/Application Support/dsh-app`, which is where this started):
-/// the GUI is a second front end for the same product data, so a session,
-/// setting, or credential the user created in one front end has to be there in
-/// the other. Everything the shell owns stays in the `dsh-app/` subtree
-/// (`settings::APP_DIR`) and never in the harness home's other entries — which
-/// is also what lets an uninstall remove the app without touching a session.
-///
-/// Falls back to the repository-local home only when the account has no home
-/// directory.
-fn user_data_home() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) if !home.trim().is_empty() => packaged_home(Path::new(&home)),
-        _ => PathBuf::from(".dsh-build").join("home"),
-    }
-}
-
-/// Where a packaged run keeps its state inside one user's home directory.
-///
-/// Split out from [`user_data_home`] so the shape can be asserted without
-/// mutating `HOME`, which this test process shares with every other test.
-fn packaged_home(user_home: &Path) -> PathBuf {
-    user_home.join(".dsh")
-}
-
-/// Resolve the shell's configuration.
-///
-/// The runtime is served from the store under the shell's home (design doc D10):
-/// the app bundle carries only a seed, and updates replace the store copy. An
-/// already-populated store therefore wins, and `.dsh-build/runtimes` is used
-/// only until the first seed has been installed — which keeps a fresh checkout
-/// working with nothing but `pnpm runtime:prepare`.
-///
-/// Node resolution is **not** done here: only a preset knows its own `node`
-/// override, and a `slim` build may legitimately have none at all
-/// (spec §2.1).
-pub fn load(home: &Path, store: &RuntimeStore) -> Result<AppConfig, String> {
-    let root = repo_root();
-    let dir = match store.active_dir() {
-        Some(dir) => dir,
-        None => newest_runtime_dir(&root.join(".dsh-build").join("runtimes"))?,
-    };
-    RuntimeManifest::load(&dir)?;
-    let settings = crate::settings::load(home);
-    let settings_problems = settings.problem.iter().cloned().collect();
-
-    Ok(AppConfig {
-        home: home.to_path_buf(),
-        runtime: RuntimeConfig { dir },
-        settings_problems,
-    })
-}
-
-/// The first-run seed runtime the bundle carries, if any.
-///
-/// Resolved at runtime rather than staged into `OUT_DIR`, because the closure is
-/// hundreds of megabytes: copying it on every build would dominate build time,
-/// and a build-script copy would silently go stale whenever
-/// `pnpm runtime:prepare` rebuilt it. Candidate layouts, in order:
-///
-/// * a packaged app — `<bundle>/Contents/Resources/runtimes/<id>/`
-/// * a development build — `<repo>/.dsh-build/runtimes/<id>/`
-pub fn seed_runtime_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let beside_exe = exe.parent()?.join("seed-runtime");
-    let resources = exe.parent()?.join("../Resources/runtimes");
-    let develop = repo_root().join(".dsh-build").join("runtimes");
-    for candidate in [beside_exe, resources, develop] {
-        if let Some(seed) = newest_runtime_dir(&candidate).ok() {
-            return Some(seed);
-        }
-    }
-    None
-}
-
-/// Where a resolved Node came from.
-///
-/// Carried so the UI and the logs can say which runtime is in use: an explicit
-/// choice, the copy the app carries, and a discovered installation behave
-/// differently when something goes wrong, and "which node is it using" is the
-/// first question in every such case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a resolved `dsh` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum NodeSource {
-    /// The preset named it.
-    Preset,
-    /// `DSH_APP_NODE` named it.
+pub enum DshSource {
+    /// `DSH_APP_DSH` named it — one session.
     Environment,
     /// The settings file named it — what the user typed into the shell's form.
     Settings,
-    /// The copy the app bundle carries.
-    Bundled,
-    /// Found at a standard installation location.
-    Installed,
 }
 
-impl NodeSource {
+impl DshSource {
     /// Stable label for the payload and diagnostics.
     pub fn label(self) -> &'static str {
         match self {
-            NodeSource::Preset => "preset",
-            NodeSource::Environment => "DSH_APP_NODE",
-            NodeSource::Settings => "settings",
-            NodeSource::Bundled => "bundled",
-            NodeSource::Installed => "installed",
+            DshSource::Environment => "DSH_APP_DSH",
+            DshSource::Settings => "settings",
         }
     }
 }
 
-/// A Node executable together with where it was found.
+/// A `dsh` executable together with where it was found.
 #[derive(Debug, Clone)]
-pub struct ResolvedNode {
+pub struct ResolvedDsh {
     pub path: PathBuf,
-    pub source: NodeSource,
+    pub source: DshSource,
 }
 
-/// The outcome of Node resolution.
+/// The outcome of resolution.
 ///
-/// `Unconfigured` is a **state, not an error** (spec §1): a `slim` build with no
-/// Node named anywhere is waiting for the user to fill in the form, and must not
-/// show an error before they have had the chance.
+/// `Unconfigured` is a **state, not an error**: a shell that has not been told
+/// where dsh is waits for the user to fill in the form, and must not show an
+/// error before they have had the chance.
 #[derive(Debug, Clone)]
-pub enum NodeResolution {
-    Configured(ResolvedNode),
+pub enum DshResolution {
+    Configured(ResolvedDsh),
     Unconfigured,
 }
 
-impl NodeResolution {
-    /// The resolved Node, when there is one.
-    pub fn node(&self) -> Option<&ResolvedNode> {
+impl DshResolution {
+    /// The resolved executable, when there is one.
+    pub fn dsh(&self) -> Option<&ResolvedDsh> {
         match self {
-            NodeResolution::Configured(node) => Some(node),
-            NodeResolution::Unconfigured => None,
+            DshResolution::Configured(dsh) => Some(dsh),
+            DshResolution::Unconfigured => None,
         }
     }
 }
 
-/// Where auto-discovery stands for this build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeOptions {
-    /// Release behaviour: never guess (spec §2).
-    Explicit,
-    /// Development only: also try standard locations and `PATH`, so `cargo run`
-    /// works in a devshell without ceremony.
-    ///
-    /// Consequence to remember when testing: a dev build almost always finds a
-    /// Node, so the "unconfigured" flow can only be exercised by a release build.
-    Discover,
-}
-
-impl NodeOptions {
-    /// What this build should do.
-    pub fn for_current_build() -> Self {
-        if cfg!(debug_assertions) {
-            NodeOptions::Discover
-        } else {
-            NodeOptions::Explicit
-        }
-    }
-}
-
-/// Everything resolution needs besides the explicit per-preset value.
-pub struct NodeContext<'a> {
-    pub settings: &'a Settings,
-    pub options: NodeOptions,
-    /// A development checkout's staged Node installs, searched at level 4
-    /// alongside the bundle's copy. Empty for a packaged app.
-    pub staged: &'a [PathBuf],
-}
-
-/// Resolve the Node executable for one runtime directory.
+/// Resolve the executable the shell launches.
 ///
 /// Precedence, highest first (spec §2):
 ///
-/// 1. the preset's `node` — the most specific scope;
-/// 2. `DSH_APP_NODE` — one session;
-/// 3. `settings.json` — this machine;
-/// 4. the Node the app bundle carries, when it carries one;
-/// 5. *development builds only*: a standard installation location, then `PATH`.
+/// 1. `DSH_APP_DSH` — one session (a terminal, a CI job);
+/// 2. the settings file — this machine.
 ///
-/// "More specific scope wins" is what makes a per-preset override usable at all:
-/// if the settings file outranked the preset, the override could never take
-/// effect once the form had been filled in.
-///
-/// A value that was named but is unusable (missing, not executable) is an error
-/// rather than a reason to fall through: silently launching a different Node than
-/// the one that was asked for is worse than saying so.
-pub fn resolve_node(
-    explicit: Option<&str>,
-    context: &NodeContext<'_>,
-) -> Result<NodeResolution, String> {
-    // 1. The preset's own choice.
-    if let Some(chosen) = non_empty(explicit) {
+/// A value that was named but is unusable (missing, a directory, not executable)
+/// is an error rather than a reason to fall through: silently launching a
+/// different dsh than the one that was asked for is worse than saying so.
+pub fn resolve_dsh(settings: &Settings) -> Result<DshResolution, String> {
+    resolve_dsh_with(std::env::var("DSH_APP_DSH").ok().as_deref(), settings)
+}
+
+/// `resolve_dsh` with the session-level value passed in, so the precedence can be
+/// tested without mutating the environment of a shared test process.
+pub fn resolve_dsh_with(from_env: Option<&str>, settings: &Settings) -> Result<DshResolution, String> {
+    if let Some(chosen) = non_empty(from_env) {
         let path = PathBuf::from(chosen);
         return match usable(&path) {
-            true => Ok(NodeResolution::Configured(ResolvedNode {
+            true => Ok(DshResolution::Configured(ResolvedDsh {
                 path,
-                source: NodeSource::Preset,
+                source: DshSource::Environment,
+            })),
+            false => Err(format!("DSH_APP_DSH is not an executable file: {}", path.display())),
+        };
+    }
+
+    if let Some(chosen) = non_empty(settings.dsh.as_deref()) {
+        let path = PathBuf::from(chosen);
+        return match usable(&path) {
+            true => Ok(DshResolution::Configured(ResolvedDsh {
+                path,
+                source: DshSource::Settings,
             })),
             false => Err(format!(
-                "the preset's node is not an executable file: {}\n\
-                 fix the preset's `node` setting, or remove it to use the app's own runtime",
+                "the configured dsh is not an executable file: {}\n\
+                 fix the path in the shell's form, or clear it to stay unconfigured",
                 path.display()
             )),
         };
     }
 
-    // 2. The session.
-    if let Ok(from_env) = std::env::var("DSH_APP_NODE") {
-        if let Some(chosen) = non_empty(Some(&from_env)) {
-            let path = PathBuf::from(chosen);
-            return match usable(&path) {
-                true => Ok(NodeResolution::Configured(ResolvedNode {
-                    path,
-                    source: NodeSource::Environment,
-                })),
-                false => Err(format!(
-                    "DSH_APP_NODE is not an executable file: {}",
-                    path.display()
-                )),
-            };
-        }
-    }
-
-    // 3. What the user typed into the shell's form.
-    if let Some(chosen) = non_empty(context.settings.node.as_deref()) {
-        let path = PathBuf::from(chosen);
-        return match usable(&path) {
-            true => Ok(NodeResolution::Configured(ResolvedNode {
-                path,
-                source: NodeSource::Settings,
-            })),
-            false => Err(format!(
-                "settings.json names a node that is not an executable file: {}\n\
-                 re-enter it in the shell's Node path field",
-                path.display()
-            )),
-        };
-    }
-
-    // 4. The copy the app carries — this is what makes `bundled` zero-config —
-    // then a development checkout's staged install.
-    for candidate in bundled_node_candidates().iter().chain(context.staged) {
-        if usable(candidate) {
-            return Ok(NodeResolution::Configured(ResolvedNode {
-                path: candidate.clone(),
-                source: NodeSource::Bundled,
-            }));
-        }
-    }
-
-    // 5. Development conveniences, never present in a release build: a macOS app
-    // started from Finder does not inherit the login shell's environment, so
-    // "look on PATH" would choose from an environment the user never set up.
-    if context.options == NodeOptions::Discover {
-        for candidate in installed_node_candidates() {
-            if usable(&candidate) {
-                return Ok(NodeResolution::Configured(ResolvedNode {
-                    path: candidate,
-                    source: NodeSource::Installed,
-                }));
-            }
-        }
-    }
-
-    Ok(NodeResolution::Unconfigured)
+    Ok(DshResolution::Unconfigured)
 }
 
-/// The message shown when nothing is configured. Phrased as guidance, because
-/// that is what it is: the form is the answer, not an error dialog.
-pub fn unconfigured_message() -> String {
-    "no Node runtime is configured.\n\
-     \n\
-     A `slim` build carries none: name the Node this app should use in the shell's\n\
-     Node path field, or set DSH_APP_NODE=/path/to/node for one session.\n\
-     \n\
-     Use a Node from nodejs.org: a distribution-repackaged build can load the\n\
-     require-builtin addon and then refuse every id, which breaks live reload."
-        .to_owned()
-}
-
-/// The Node the running executable's bundle carries, if any.
-fn bundled_node_candidates() -> Vec<PathBuf> {
-    let Ok(exe) = std::env::current_exe() else {
-        return Vec::new();
-    };
-    let Some(dir) = exe.parent() else {
-        return Vec::new();
-    };
-    // It sits in Resources rather than MacOS because `Contents/MacOS` is reserved
-    // for the shell executable (design doc A.3).
-    vec![dir.join("../Resources/node/bin/node")]
-}
-
-/// Node installations staged for a development checkout.
-pub fn staged_candidates(root: &Path) -> Vec<PathBuf> {
-    let staged = root.join(".dsh-build").join("node");
-    let mut candidates = Vec::new();
-    if let Some(version) = bundled_node_version(root) {
-        candidates.push(staged.join(&version).join("bin").join("node"));
-    }
-    if let Ok(entries) = std::fs::read_dir(&staged) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("bin").join("node");
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-    candidates
-}
-
-/// Standard locations and `PATH`, for development builds only.
-fn installed_node_candidates() -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    if let Ok(path) = std::env::var("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("node")));
-    }
-    candidates
-}
-
-/// A non-empty, trimmed value.
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// Whether this path can actually be launched.
-///
-/// `is_file()` alone is not enough: a plain file without the execute bit, or a
-/// non-Node binary, would pass it and fail much later with a confusing message
-/// (spec §3.1).
+/// Whether the path is an executable file the shell could spawn.
 pub fn usable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    metadata.is_file() && is_executable(&metadata)
 }
 
-/// The Node version the shell bundles, read from the root manifest's pin.
-fn bundled_node_version(root: &Path) -> Option<String> {
-    let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
-    Some(manifest.get("dshRuntime")?.get("nodeVersion")?.as_str()?.to_owned())
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
 }
 
-/// The newest prepared runtime by directory name.
-fn newest_runtime_dir(runtimes: &Path) -> Result<PathBuf, String> {
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(runtimes)
-        .map_err(|error| {
-            format!(
-                "no prepared runtime under {}: {error}\nrun `pnpm runtime:prepare` first",
-                runtimes.display()
-            )
-        })?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.join("runtime.json").is_file())
-        .collect();
-    candidates.sort();
-    candidates
-        .pop()
-        .ok_or_else(|| format!("no prepared runtime under {}\nrun `pnpm runtime:prepare` first", runtimes.display()))
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// The message shown when nothing is configured. Guidance, not an error.
+pub fn unconfigured_message() -> String {
+    "no dsh executable is configured yet. Run `which dsh` in a terminal and paste \
+     the path into this form."
+        .to_owned()
+}
+
+/// The harness home the shell drives: where profiles come from, and what the
+/// child is told as `DSH_HOME`.
+///
+/// Precedence, highest first — the same "more specific scope wins" rule the dsh
+/// path follows:
+///
+/// 1. `DSH_HOME` — one session, and what makes `DSH_HOME=$(mktemp -d) dsh-app`
+///    an isolated run;
+/// 2. the form's value — this machine;
+/// 3. `$HOME/.dsh` — the harness's own default. Its resolver calls
+///    `os.homedir()`, which honours `HOME`, so the two agree without either
+///    having to say anything.
+///
+/// The shell's *own* configuration deliberately does not live here: it is in the
+/// shell's config directory (`settings::config_dir`), so that a value in it can
+/// never decide where it is, and so `DSH_HOME=$(mktemp -d)` isolates the harness
+/// without making the app forget which dsh you use.
+pub fn resolve_home(settings: &Settings) -> PathBuf {
+    resolve_home_with(
+        std::env::var("DSH_HOME").ok().as_deref(),
+        settings.home.as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// `resolve_home` with every input passed in, so the rule can be tested
+/// without mutating the environment of a shared test process.
+fn resolve_home_with(dsh_home: Option<&str>, from_settings: Option<&str>, user_home: Option<&str>) -> PathBuf {
+    let user_home = non_empty(user_home).map(PathBuf::from);
+    if let Some(value) = non_empty(dsh_home) {
+        return expand_tilde(value, user_home.as_deref());
+    }
+    if let Some(value) = non_empty(from_settings) {
+        return expand_tilde(value, user_home.as_deref());
+    }
+    match user_home {
+        Some(home) => home.join(".dsh"),
+        // No `HOME` at all: there is nowhere sensible to write. The shell reports
+        // this when it cannot create the path, and the child is told the same
+        // thing rather than resolving a home of its own.
+        None => PathBuf::from(".dsh"),
+    }
+}
+
+/// Expand a leading `~` the way the harness does, so a home typed as `~/.dsh`
+/// means the same thing to both.
+fn expand_tilde(value: &str, user_home: Option<&Path>) -> PathBuf {
+    let Some(home) = user_home else {
+        return PathBuf::from(value);
+    };
+    if value == "~" {
+        return home.to_path_buf();
+    }
+    match value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(value),
+    }
+}
+
+/// Check a harness home the user typed, returning the absolute path to use.
+///
+/// Blank means the default. Anything else must be absolute after expanding `~`,
+/// and the directory is created here: the shell needs it as the child's `DSH_HOME`
+/// and as its working directory, so "this path cannot be created" is exactly the
+/// verdict the form should show.
+pub fn check_home(value: &str) -> Result<PathBuf, String> {
+    let user_home = non_empty(std::env::var("HOME").ok().as_deref()).map(PathBuf::from);
+    let path = match non_empty(Some(value)) {
+        Some(typed) => expand_tilde(typed, user_home.as_deref()),
+        None => match user_home {
+            Some(home) => home.join(".dsh"),
+            None => PathBuf::from(".dsh"),
+        },
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "{} is not an absolute path; the harness home cannot be relative",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(&path).map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    Ok(path)
+}
+
+/// Load the shell's configuration from its own config directory.
+pub fn load(config_dir: &Path) -> AppConfig {
+    let report = settings::load(config_dir);
+    AppConfig {
+        home: resolve_home(&report.settings),
+        config_dir: config_dir.to_path_buf(),
+        settings_problems: report.problem.iter().cloned().collect(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    /// An executable scratch file, so `usable` has something real to look at.
-    fn executable(dir: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    /// A scratch directory, removed by `Drop`.
+    struct Scratch(PathBuf);
 
-        let path = dir.join(name);
-        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the file is writable");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod works");
-        path
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is after the epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dsh-app-config-{name}-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
-        dir
-    }
-
-    #[test]
-    fn the_environment_override_wins_over_every_default() {
-        // SAFETY: single-threaded test process, and the value is removed again
-        // before the test returns.
-        unsafe { std::env::set_var("DSH_APP_HOME", "/tmp/dsh-app-isolated-home") };
-        assert_eq!(resolve_home(Path::new("/repo")), PathBuf::from("/tmp/dsh-app-isolated-home"));
-        unsafe { std::env::remove_var("DSH_APP_HOME") };
-    }
-
-    #[test]
-    fn a_blank_override_still_means_the_default_home() {
-        // SAFETY: see the test above.
-        unsafe { std::env::set_var("DSH_APP_HOME", "   ") };
-        let home = resolve_home(Path::new("/repo"));
-        unsafe { std::env::remove_var("DSH_APP_HOME") };
-        // The cargo test binary lives under target/, so this is the checkout
-        // default and never the packaged state directory.
-        assert!(home.ends_with(".dsh-build/home"), "{}", home.display());
-    }
-
-    #[test]
-    fn a_development_checkout_keeps_state_inside_the_repository() {
-        if std::env::var("DSH_APP_HOME").is_ok_and(|value| !value.trim().is_empty()) {
-            return;
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dsh-app-config-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+            Scratch(dir)
         }
-        let home = resolve_home(Path::new("/repo"));
-        // The test binary runs from target/, which is never a `.app` bundle:
-        // the checkout default must stay repository-local.
-        assert_eq!(home, PathBuf::from("/repo/.dsh-build/home"));
+
+        /// An executable file at `name`, plus its absolute path.
+        fn executable(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the file is writable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("it is chmod-able");
+            }
+            path
+        }
+
+        /// A non-executable file at `name`, plus its absolute path.
+        fn plain_file(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, "not a program").expect("the file is writable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("it is chmod-able");
+            }
+            path
+        }
     }
 
-    #[test]
-    fn a_packaged_run_uses_the_users_harness_home() {
-        // `~/.dsh` is the harness's own default home, so the packaged shell
-        // shares sessions and credentials with the CLI instead of keeping a
-        // private copy under `Library/Application Support`.
-        assert_eq!(packaged_home(Path::new("/Users/someone")), PathBuf::from("/Users/someone/.dsh"));
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
+    fn settings_naming(path: &Path) -> Settings {
+        Settings {
+            schema: None,
+            dsh: Some(path.display().to_string()),
+            home: None,
+        }
+    }
+
+    /// The whole point of the shell's form: not being told where dsh is must
+    /// stay a state, not a failure (spec §1).
     #[test]
     fn nothing_configured_is_a_state_and_not_an_error() {
-        let settings = Settings::default();
-        let empty = scratch("unconfigured");
-        let context = NodeContext {
-            settings: &settings,
-            // Release behaviour: no discovery, so the outcome cannot depend on the
-            // machine running the test.
-            options: NodeOptions::Explicit,
-            staged: &[],
-        };
-        let resolution = resolve_node(None, &context).expect("unconfigured is not a failure");
-        assert!(resolution.node().is_none());
-        let _ = std::fs::remove_dir_all(&empty);
+        let resolved = resolve_dsh_with(None, &Settings::default()).expect("absence is not an error");
+        assert!(resolved.dsh().is_none());
+        assert!(matches!(resolved, DshResolution::Unconfigured));
     }
 
     #[test]
-    fn a_staged_checkout_node_satisfies_level_four() {
-        let dir = scratch("staged");
-        let node = executable(&dir, "node");
-        let settings = Settings::default();
-        let staged = vec![node.clone()];
-        let context = NodeContext {
-            settings: &settings,
-            options: NodeOptions::Explicit,
-            staged: &staged,
-        };
-        let resolved = resolve_node(None, &context).expect("a staged node resolves").node().cloned();
-        assert_eq!(resolved.map(|node| node.path), Some(node));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn the_settings_file_names_the_executable() {
+        let scratch = Scratch::new("from-settings");
+        let path = scratch.executable("dsh");
+        let resolved = resolve_dsh_with(None, &settings_naming(&path)).expect("resolution succeeds");
+        let dsh = resolved.dsh().expect("a dsh is configured");
+        assert_eq!(dsh.path, path);
+        assert_eq!(dsh.source, DshSource::Settings);
     }
 
     #[test]
-    fn a_configured_node_outranks_the_bundle() {
-        let dir = scratch("settings");
-        let node = executable(&dir, "node");
-        let settings = Settings {
-            schema: None,
-            node: Some(node.display().to_string()),
-            pnpm: None,
-        };
-        let context = NodeContext {
-            settings: &settings,
-            options: NodeOptions::Explicit,
-            staged: &[],
-        };
-        let resolved = resolve_node(None, &context).expect("a configured node resolves");
-        let resolved = resolved.node().expect("it is configured");
-        assert_eq!(resolved.path, node);
-        assert_eq!(resolved.source, NodeSource::Settings);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn the_session_value_outranks_the_settings_file() {
+        let scratch = Scratch::new("precedence");
+        let from_settings = scratch.executable("dsh-from-settings");
+        let from_env = scratch.executable("dsh-from-env");
+        let resolved = resolve_dsh_with(Some(&from_env.display().to_string()), &settings_naming(&from_settings))
+            .expect("resolution succeeds");
+        assert_eq!(resolved.dsh().expect("a dsh is configured").path, from_env);
     }
 
+    /// A blank override is the same as not setting it: the common case is a
+    /// shell launched with an empty variable in the environment.
+    #[test]
+    fn a_blank_session_value_falls_through_to_the_settings_file() {
+        let scratch = Scratch::new("blank-env");
+        let path = scratch.executable("dsh");
+        let resolved = resolve_dsh_with(Some("   "), &settings_naming(&path)).expect("resolution succeeds");
+        assert_eq!(resolved.dsh().expect("a dsh is configured").path, path);
+    }
+
+    /// Named but unusable is an error, not a silent fall-through: launching a
+    /// different dsh than the one that was asked for is worse than saying so.
     #[test]
     fn a_named_but_unusable_path_is_an_error_not_a_fallthrough() {
-        let dir = scratch("unusable");
-        // Exists, but nothing may execute it: silently using a different Node
-        // would be worse than saying so.
-        let path = dir.join("node");
-        std::fs::write(&path, "not executable").expect("the file is writable");
-        let settings = Settings {
-            schema: None,
-            node: Some(path.display().to_string()),
-            pnpm: None,
-        };
-        let context = NodeContext {
-            settings: &settings,
-            options: NodeOptions::Explicit,
-            staged: &[],
-        };
-        let error = resolve_node(None, &context).expect_err("a non-executable path is refused");
+        let scratch = Scratch::new("unusable");
+        let missing = scratch.0.join("gone");
+        let error = resolve_dsh_with(None, &settings_naming(&missing)).expect_err("a missing path is an error");
         assert!(error.contains("not an executable file"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
+
+        let not_executable = scratch.plain_file("plain");
+        let error =
+            resolve_dsh_with(None, &settings_naming(&not_executable)).expect_err("a non-executable is an error");
+        assert!(error.contains("not an executable file"), "{error}");
+
+        let error = resolve_dsh_with(Some(&missing.display().to_string()), &Settings::default())
+            .expect_err("a missing DSH_APP_DSH is an error");
+        assert!(error.contains("DSH_APP_DSH"), "{error}");
     }
 
     #[test]
-    fn the_per_preset_choice_outranks_everything_else() {
-        let dir = scratch("preset");
-        let node = executable(&dir, "node");
-        let settings = Settings {
-            schema: None,
-            node: Some("/nonexistent/from-settings".to_owned()),
-            pnpm: None,
-        };
-        let context = NodeContext {
-            settings: &settings,
-            options: NodeOptions::Explicit,
-            staged: &[],
-        };
-        let resolved = resolve_node(Some(&node.display().to_string()), &context)
-            .expect("the preset's node resolves")
-            .node()
-            .cloned()
-            .expect("it is configured");
-        assert_eq!(resolved.source, NodeSource::Preset);
-        assert_eq!(resolved.path, node);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_directory_is_never_usable() {
+        let scratch = Scratch::new("directory");
+        assert!(!usable(&scratch.0));
+    }
+
+    /// The precedence the form has to explain: session, then this machine, then
+    /// the harness's own default.
+    #[test]
+    fn the_home_resolution_order_is_session_then_settings_then_default() {
+        let user = Path::new("/Users/someone");
+        assert_eq!(
+            resolve_home_with(Some("/tmp/session"), Some("/tmp/form"), Some("/Users/someone")),
+            PathBuf::from("/tmp/session")
+        );
+        assert_eq!(
+            resolve_home_with(None, Some("/tmp/form"), Some("/Users/someone")),
+            PathBuf::from("/tmp/form")
+        );
+        assert_eq!(
+            resolve_home_with(None, None, Some("/Users/someone")),
+            PathBuf::from("/Users/someone/.dsh")
+        );
+        // A blank value at either level is the same as not setting it.
+        assert_eq!(
+            resolve_home_with(Some("   "), Some("  "), Some("/Users/someone")),
+            user.join(".dsh")
+        );
+    }
+
+    /// `~` has to mean the same thing to the shell and to the harness, which
+    /// expands it too.
+    #[test]
+    fn a_tilde_is_expanded_against_the_users_home() {
+        assert_eq!(
+            resolve_home_with(None, Some("~/.dsh"), Some("/Users/someone")),
+            PathBuf::from("/Users/someone/.dsh")
+        );
+        assert_eq!(
+            resolve_home_with(None, Some("~/work/harness"), Some("/Users/someone")),
+            PathBuf::from("/Users/someone/work/harness")
+        );
+        assert_eq!(
+            resolve_home_with(None, Some("~"), Some("/Users/someone")),
+            PathBuf::from("/Users/someone")
+        );
+        assert_eq!(
+            resolve_home_with(None, Some("/work/harness"), Some("/Users/someone")),
+            PathBuf::from("/work/harness")
+        );
+    }
+
+    /// The form's verdict: blank means the default, a relative path is refused,
+    /// and anything accepted is created.
+    #[test]
+    fn a_home_is_checked_created_and_returned_absolute() {
+        let scratch = Scratch::new("home-check");
+        let target = scratch.0.join("harness-home");
+        let checked = check_home(&target.display().to_string()).expect("an absolute path is accepted");
+        assert_eq!(checked, target);
+        assert!(target.is_dir(), "the home is created so the child can use it as its cwd");
+
+        // A blank field is the default, which this test cannot create (it would
+        // be the real `$HOME/.dsh`), so only the refusal is asserted here.
+        assert!(check_home("relative/path").is_err());
+    }
+
+    #[test]
+    fn loading_a_home_without_settings_reports_no_problem() {
+        let scratch = Scratch::new("empty-home");
+        let config = load(&scratch.0);
+        assert!(config.settings_problems.is_empty(), "{:?}", config.settings_problems);
+        // The settings location is what this call was given; the driven home is
+        // resolved from the environment and the file, so it is not asserted here.
+        assert_eq!(config.config_dir, scratch.0);
     }
 }

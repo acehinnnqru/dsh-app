@@ -1,5 +1,5 @@
 {
-  description = "dsh-app — a Tauri desktop shell for DeepSeek Harness";
+  description = "dsh-app — a Tauri launcher for DeepSeek Harness profiles";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -10,15 +10,18 @@
     };
   };
 
-  # `appId` is an argument rather than an environment lookup: flake evaluation is
-  # pure, and the identifier becomes part of the code signature, so it must be
-  # stated explicitly and appear in the build it produced. Build the app with
-  # `nix build --argstr appId com.example.dsh-app .#dsh-app-bundled`.
-  # Apple Silicon macOS is the only target. Declaring it here means evaluating
-  # this flake anywhere else fails with "flake does not provide" rather than
-  # producing an artifact tagged for the wrong platform — the closure resolves
-  # native packages (`node-pty`, `koffi`, the `require-builtin` addon) for the
-  # machine that builds it, so there is no correct cross-build.
+  # This flake wraps no runtime: there is no closure to build, no Node archive to
+  # pin, and no seed to carry. What it produces is a shell binary and the .app
+  # around it.
+  #
+  # The bundle identifier is embedded in Info.plist and therefore in the
+  # signature's designated requirement, so it must be stated rather than
+  # defaulted to something nobody chose.
+  #
+  # It is read from the environment, which means app builds need --impure.
+  # Flakes cannot take arguments: --arg/--argstr are rejected for flake
+  # installables, and a repository file cannot serve either — tracked means not
+  # configurable, untracked means it never enters the flake source.
   outputs = {
     nixpkgs,
     utils,
@@ -30,134 +33,33 @@
         pkgs = import nixpkgs {inherit system;};
         inherit (nixpkgs) lib;
 
-        # The single source of truth for what this app wraps.
         rootManifest = builtins.fromJSON (builtins.readFile ./package.json);
-        dshVersion = rootManifest.dshRuntime.version;
-        dshPackage = rootManifest.dshRuntime.package;
-        nodeVersion = rootManifest.dshRuntime.nodeVersion;
         shellVersion = rootManifest.version;
 
-        # The bundle identifier is embedded in `Info.plist` and therefore in the
-        # signature's designated requirement, so it must be stated rather than
-        # defaulted to something nobody chose.
-        #
-        # It is read from the environment, which means app builds need `--impure`.
-        # Flakes cannot take arguments: `--arg`/`--argstr` are rejected for flake
-        # installables in Nix 2.34 ("incompatible with flakes"), and a repository
-        # file cannot serve either — tracked means not configurable, untracked
-        # means it never enters the flake source.
         appId = builtins.getEnv "DSH_APP_APP_ID";
         requireAppId =
           if appId == ""
           then throw ''
             DSH_APP_APP_ID is unset: an app bundle needs a bundle identifier, and
             it becomes part of the signature. It is read from the environment, so
-            build with `--impure` and export it first (`.envrc` already does):
+            build with --impure and export it first (.envrc already does):
 
-              nix build --impure .#dsh-app-bundled
+              nix build --impure .#dsh-app
           ''
           else appId;
 
-        # Always true now that the flake declares one system; the conditionals
-        # using it are kept because they mark which inputs exist *because of*
-        # macOS, which is what a future Linux port would have to revisit.
+        # Apple Silicon macOS is the only target, because that is the only
+        # platform the shell has been run on.
         isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-        # Node's own arch spelling: `arm64`, not Nix's `aarch64`. The same tag
-        # appears in `runtime.json`, the Node archive names, and
-        # `channel::platform_tag`; a second convention would silently stop
-        # matching.
-        platformTag = "${pkgs.stdenv.hostPlatform.parsed.kernel.name}-arm64";
 
-        nodejs = pkgs.nodejs_22;
-        # Pinned explicitly: the closure recipe depends on pnpm's deploy
-        # semantics, so the flake must name the version it was verified against
-        # rather than inherit whatever the caller's PATH happens to offer.
         pnpm = pkgs.pnpm;
 
         # The composition helpers this repository's devShell has always used.
         ts = devshells.legacyPackages.${system}.toolsets;
         inherit (ts.lib) combine mkShellArgs;
 
-        # The dsh runtime closure, built by the same script the repository uses.
-        #
-        # Reusing `scripts/prepare-runtime.mjs` instead of restating the pnpm
-        # deploy flags here is deliberate: those flags (hoisted linker, peers
-        # installed for real) are exactly the part that would silently rot in a
-        # second copy.
-        #
-        # Reproducibility caveat: this derivation is NOT yet a fixed-output
-        # derivation, so it resolves from the network at build time. Pinning it
-        # (fetchPnpmDeps + an offline install) is tracked as M7 follow-up work —
-        # see docs/design-tauri-wrapper.md §16.
-        dshRuntime =
-          pkgs.stdenv.mkDerivation {
-            pname = "dsh-runtime";
-            version = dshVersion;
-            src = ./.;
-
-            nativeBuildInputs = [nodejs pnpm pkgs.cacert];
-
-            # The closure recipe writes next to the repository; point it at the
-            # build directory instead.
-            DSH_BUILD_ROOT = "build";
-            # pnpm needs a home for its store and metadata inside the sandbox.
-            HOME = "home";
-            npm_config_store_dir = "store";
-            # `CI=1` is set by the Nix build environment and changes pnpm's
-            # interactive behaviour; the recipe is written for a plain run.
-            CI = "false";
-
-            buildPhase = ''
-              export HOME="$PWD/home"
-              mkdir -p "$HOME" "$PWD/build"
-              echo "pnpm $(pnpm --version), node $(node --version)"
-              node scripts/prepare-runtime.mjs --version ${dshVersion}
-            '';
-
-            installPhase = ''
-              closure="$(find build/runtimes -maxdepth 1 -mindepth 1 -type d | head -n1)"
-              [ -n "$closure" ] || { echo "no closure was produced" >&2; exit 1; }
-              mkdir -p "$out"
-              cp -R "$closure/." "$out/"
-            '';
-
-            dontFixup = true;
-            dontStrip = true;
-            requiredSystemFeatures = ["big-parallel"];
-          };
-
-        # The official Node the shell bundles.
-        #
-        # Only an official build provides `require-builtin` — the addon matches
-        # the running binary's machine code, so a distro-repackaged Node loads it
-        # and then refuses every id (design doc §11.3). Hence nodejs.org and not
-        # a nixpkgs Node.
-        #
-        # The tarball is hashed by `fetchurl`; the upstream `SHASUMS256.txt` value
-        # was checked against it once and matches, so both the transport and the
-        # content are accounted for.
-        officialNode = pkgs.stdenv.mkDerivation {
-          pname = "dsh-app-node";
-          version = nodeVersion;
-          src = pkgs.fetchurl {
-            url = "https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-${platformTag}.tar.gz";
-            hash = "sha256-T8MmajcC7rw5zDdmHPTuzureMH4kKrZOTXznlJGX4R8=";
-          };
-          # The archive already has the layout we want; strip the version prefix
-          # and drop what a runtime does not need.
-          sourceRoot = "node-v${nodeVersion}-${platformTag}";
-          dontConfigure = true;
-          dontBuild = true;
-          installPhase = ''
-            mkdir -p "$out"
-            cp -R bin lib include share "$out/" 2>/dev/null || true
-            rm -rf "$out/include" "$out/share"
-          '';
-          dontFixup = true;
-        };
-
         # The shell. Built directly with cargo rather than through `tauri build`:
-        # the frontend is three static files that need no toolchain, and the real
+        # the frontend is four static files that need no toolchain, and the real
         # GUI is served by the runtime at run time.
         dshApp = pkgs.rustPlatform.buildRustPackage {
           pname = "dsh-app";
@@ -171,7 +73,7 @@
             [pkgs.pkg-config]
             ++ lib.optionals isDarwin [pkgs.apple-sdk_14];
 
-          # The shell page and the presets are embedded; nothing else is compiled.
+          # The shell page is embedded; nothing else is compiled.
           # `cargoRoot = "src-tauri"` is where `cargoSetupHook` stages the vendor
           # config, but each phase runs in its own shell, so a path exported by
           # `preBuild` would not survive. Locate the crate in each phase instead.
@@ -219,128 +121,52 @@
           dontFixup = true;
         };
 
-        # A shippable, unsigned `.app`. Signing is a separate documented step: it
+        # A shippable, unsigned .app. Signing is a separate documented step: it
         # needs credentials and cannot be deterministic (design doc §7.2).
-        mkApp = {
-          name,
-          withNode,
-          withPnpm,
-          withSeed,
-        }:
-          pkgs.stdenv.mkDerivation {
-            pname = name;
-            version = shellVersion;
-            dontUnpack = true;
+        #
+        # There is one variant and one only. The shell carries no Node, no pnpm,
+        # and no runtime closure, so there is nothing for a second packaging of
+        # the same binary to vary.
+        app = pkgs.stdenv.mkDerivation {
+          pname = "dsh-app";
+          version = shellVersion;
+          dontUnpack = true;
 
-            nativeBuildInputs = [pkgs.rsync];
-            DSH_APP_APP_ID = requireAppId;
+          DSH_APP_APP_ID = requireAppId;
 
-            buildPhase = ''
-              work="$PWD/work"
-              mkdir -p "$work/bin" "$work/out"
+          buildPhase = ''
+            work="$PWD/work"
+            mkdir -p "$work/bin" "$work/out"
 
-              # Every destination below names its file or directory explicitly.
-              # `cp <file> <dir>/` keeps the SOURCE basename, and a Nix store path
-              # is prefixed with its hash — which silently produced
-              # `1sc98ak...-assemble-app.sh` and, worse, a seed runtime directory
-              # named after the hash instead of the version the shell looks for.
-              crate="$work/src-tauri"
-              mkdir -p "$crate/packaging" "$crate/presets" "$crate/icons"
-              cp ${./src-tauri/packaging/assemble-app.sh} "$crate/packaging/assemble-app.sh"
-              chmod +x "$crate/packaging/assemble-app.sh"
-              cp -R ${./src-tauri/presets}/. "$crate/presets/"
-              cp ${./src-tauri/icons/icon.icns} "$crate/icons/icon.icns"
-              install -m 755 ${dshApp}/bin/dsh-app "$work/bin/dsh-app"
+            # Every destination below names its file explicitly: `cp <file> <dir>/`
+            # keeps the SOURCE basename, and a Nix store path is prefixed with its
+            # hash, which once produced a bundle asset named after the hash.
+            crate="$work/src-tauri"
+            mkdir -p "$crate/packaging" "$crate/icons"
+            cp ${./src-tauri/packaging/assemble-app.sh} "$crate/packaging/assemble-app.sh"
+            chmod +x "$crate/packaging/assemble-app.sh"
+            cp ${./src-tauri/icons/icon.icns} "$crate/icons/icon.icns"
+            install -m 755 ${dshApp}/bin/dsh-app "$work/bin/dsh-app"
 
-              seed=""
-              ${lib.optionalString (withSeed != null) ''
-                # `runtime.json` names the version; the directory must match it,
-                # because the shell installs the seed under that name.
-                seed="$work/seed"
-                mkdir -p "$seed"
-                cp -R ${withSeed}/. "$seed/"
-              ''}
+            "$crate/packaging/assemble-app.sh" \
+              --binary "$work/bin/dsh-app" \
+              --out "$work/out" \
+              --bundle-id ${requireAppId} \
+              --version ${shellVersion}
+          '';
 
-              "$crate/packaging/assemble-app.sh" \
-                --binary "$work/bin/dsh-app" \
-                --out "$work/out" \
-                --bundle-id ${requireAppId} \
-                ${lib.optionalString (withSeed != null) ''--seed "$seed" \''}
-                --version ${shellVersion}
+          installPhase = ''
+            mkdir -p "$out/Applications"
+            cp -R "$PWD/work/out/dsh-app.app" "$out/Applications/"
+          '';
 
-              ${lib.optionalString withNode ''
-                # The bundled Node sits beside the shell executable: sidecar
-                # resolution is relative to the executable's directory, and
-                # Tauri's bundler only signs inside MacOS.
-                mkdir -p "$work/out/dsh-app.app/Contents/Resources/node"
-                cp -R ${officialNode}/. "$work/out/dsh-app.app/Contents/Resources/node/"
-              ''}
-
-              ${lib.optionalString withPnpm ''
-                # pnpm is what `dsh plugin` forwards to, so without it plugin
-                # management cannot work at all (the CLI shells out to `pnpm` on
-                # PATH and exits 127 when it is absent).
-                #
-                # The package's own `bin/pnpm` is a symlink to `pnpm.mjs` whose
-                # shebang names a Node in the Nix store, which would neither exist
-                # on a user's machine nor pass the hardened runtime's library
-                # check. So the JavaScript is shipped as data and reached through a
-                # wrapper that runs it with the Node this bundle carries.
-                mkdir -p "$work/out/dsh-app.app/Contents/Resources/pnpm" \
-                         "$work/out/dsh-app.app/Contents/Resources/bin"
-                cp -R ${pnpm}/libexec/pnpm/. "$work/out/dsh-app.app/Contents/Resources/pnpm/"
-                cat > "$work/out/dsh-app.app/Contents/Resources/bin/pnpm" <<'PNPM_WRAPPER'
-#!/bin/sh
-# Run the bundled pnpm with the bundled Node.
-#
-# The path is resolved from this script's own location so the app keeps working
-# when the bundle is moved. `exec` keeps pnpm's exit status intact, which
-# `dsh plugin` forwards.
-set -e
-here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$here/node/bin/node" "$here/pnpm/bin/pnpm.mjs" "$@"
-PNPM_WRAPPER
-                chmod 755 "$work/out/dsh-app.app/Contents/Resources/bin/pnpm"
-              ''}
-            '';
-
-            installPhase = ''
-              mkdir -p "$out/Applications"
-              cp -R "$PWD/work/out/dsh-app.app" "$out/Applications/"
-            '';
-
-            dontFixup = true;
-          };
+          dontFixup = true;
+        };
       in {
         packages = {
-          # The runtime closure alone: usable by CI that packages the app itself.
-          dsh-runtime = dshRuntime;
-          # The official Node archive, pinned by hash.
-          node = officialNode;
-          # Shell + seed runtime, relying on the user's own Node (design doc D2).
-          #
-          # The two variants differ by exactly one thing: the runtime a plugin
-          # needs. `bundled` carries Node and pnpm and needs no configuration;
-          # `slim` carries neither, so the user names a Node (per preset or via
-          # `DSH_APP_NODE`) and plugin management needs one on PATH.
-          dsh-app-slim = mkApp {
-            name = "dsh-app-slim";
-            withNode = false;
-            withPnpm = false;
-            withSeed = dshRuntime;
-          };
-          dsh-app-bundled = mkApp {
-            name = "dsh-app-bundled";
-            withNode = true;
-            withPnpm = true;
-            withSeed = dshRuntime;
-          };
-          default = mkApp {
-            name = "dsh-app-bundled";
-            withNode = true;
-            withPnpm = true;
-            withSeed = dshRuntime;
-          };
+          # The shell and the bundle it lives in. One product, one name.
+          dsh-app = app;
+          default = app;
         };
 
         devShells.default = pkgs.mkShell (mkShellArgs (combine [
@@ -381,11 +207,10 @@ PNPM_WRAPPER
           {
             packages = [
               pkgs.pkg-config
-              pkgs.rsync
-              # The same pnpm the packaging derivations use. `packageManager` in
-              # package.json is deliberately absent: it makes pnpm re-exec a
-              # different version it then has to download, which in a sandbox
-              # with no network fails silently (see §16).
+              # The Tauri CLI and the dev tooling are Node programs; pnpm runs
+              # them. `packageManager` in package.json is deliberately absent: it
+              # makes pnpm re-exec a different version it then has to download,
+              # which in a sandbox with no network fails silently.
               pnpm
             ] ++ lib.optionals isDarwin [
               # Tauri/wry links the system WKWebView and these frameworks.

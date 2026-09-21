@@ -1,10 +1,17 @@
-//! Child supervision for one preset.
+//! Child supervision for one profile.
 //!
 //! The shell's whole coupling to dsh is: spawn it, read the readiness line from
 //! stdout, and shut it down with SIGTERM before escalating. Everything else the
 //! runtime does is opaque to us, which is what keeps the shell version-agnostic.
 //!
+//! The executable is the user's own `dsh`. The shell passes **no** Node flags:
+//! those belong to whatever that executable wraps, and a shell that starts
+//! second-guessing them is back to being a runtime installer (spec §5, D8). It
+//! does name the home, so that what the window lists and what the child writes
+//! cannot be two different directories.
+//!
 //! @see docs/design-tauri-wrapper.md D5, D6
+//! @see docs/spec-external-dsh.md §5
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -14,9 +21,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::ResolvedNode;
-use crate::preset::Preset;
-
 /// Readiness timeout: how long the launcher may take to print its URL line.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// SIGTERM grace, matching the harness `PROCESS_SHUTDOWN_TIMEOUT_MS`.
@@ -24,7 +28,7 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// How many stderr lines to retain for diagnostics.
 const STDERR_TAIL: usize = 40;
 
-/// Observable state of one supervised preset.
+/// Observable state of one supervised profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Starting,
@@ -45,30 +49,18 @@ impl Phase {
     }
 }
 
-/// Everything the UI needs to render one preset row.
+/// Everything the UI needs to render one profile row.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    pub preset_id: String,
-    pub label: String,
-    pub profile: String,
     pub phase: Phase,
     pub stderr_tail: Vec<String>,
-    /// Patch overlays this child was started with, in application order.
-    pub patch_files: Vec<PathBuf>,
-    /// The Node executable in use, and where it came from.
-    pub node: PathBuf,
-    pub node_source: &'static str,
 }
 
 /// A live child plus its reported state.
 pub struct SupervisedChild {
-    preset: Preset,
-    /// The runtime this child was launched with, and where it came from.
-    node: ResolvedNode,
     child: Child,
     phase: Phase,
     stderr_tail: Arc<Mutex<Vec<String>>>,
-    patch_files: Vec<PathBuf>,
 }
 
 /// Extract the authenticated URL from one stdout line.
@@ -86,36 +78,18 @@ pub fn parse_ready_line(line: &str) -> Option<String> {
 }
 
 /// Build the child environment: never inherit `NODE_OPTIONS` or package-manager
-/// state (the harness Electron shell strips the same names).
+/// state (the harness Electron shell strips the same names), and name the home
+/// explicitly.
 ///
-/// `pnpm` is the executable the user named, when they named one. `dsh plugin` runs
-/// `pnpm` from PATH in the profile directory, so whoever we want it to find has to
-/// come first: the user's choice when there is one, otherwise the copy the
-/// `bundled` variant carries. Without either, the command fails with exit 127 —
-/// which is the whole of what a missing pnpm costs, because pnpm never gates the
-/// GUI (spec §4).
-fn child_environment(home: &PathBuf, preset: &Preset, pnpm: &Path) -> BTreeMap<String, String> {
+/// `DSH_HOME` **is** set, to the home this shell resolved, and any inherited
+/// `DSH_HOME` is dropped first. Both halves are about agreement: the harness
+/// gives `DSH_HOME` precedence over `~/.dsh`, so a value exported in the
+/// terminal the app was launched from would otherwise point the child at a
+/// different home than the profile list the window is showing; and the shell may
+/// itself have taken its home *from* `DSH_HOME`, in which case the child has to
+/// be told that answer rather than recomputing one.
+fn child_environment(home: &Path) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    let mut path_prefix: Option<PathBuf> = None;
-
-    if let Some(dir) = pnpm.parent() {
-        path_prefix = Some(dir.to_path_buf());
-    } else if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled_bin = dir.join("../Resources/bin");
-            if bundled_bin.is_dir() {
-                path_prefix = Some(bundled_bin);
-            }
-        }
-    }
-
-    if let Some(dir) = path_prefix {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        env.insert(
-            "PATH".to_owned(),
-            format!("{}:{existing}", dir.display()),
-        );
-    }
     for (name, value) in std::env::vars() {
         if name == "NODE_OPTIONS" || name.starts_with("DSH_") {
             continue;
@@ -126,85 +100,50 @@ fn child_environment(home: &PathBuf, preset: &Preset, pnpm: &Path) -> BTreeMap<S
         }
         env.insert(name, value);
     }
+    // After the filter, so an inherited `DSH_HOME` can never win over ours.
     env.insert("DSH_HOME".to_owned(), home.display().to_string());
-    for (name, value) in &preset.env {
-        env.insert(name.clone(), value.clone());
-    }
     env
 }
 
 /// What one launch needs to know about the machine.
-///
-/// Grouped because they travel together and are all decided by the shell before
-/// the launch: which Node runs the closure, what to run, where, which home the
-/// child gets, and which pnpm `dsh plugin` should find.
 pub struct Launch {
-    /// The resolved Node, with where it came from.
-    pub node: ResolvedNode,
-    /// The closure's `lib/bin.js`.
-    pub entry: PathBuf,
-    /// Working directory — the runtime directory.
+    /// The user's `dsh` executable, exactly as they named it.
+    pub dsh: PathBuf,
+    /// Working directory. The harness does not write to its installation, and it
+    /// boots from any directory, so this exists only to give the child a stable
+    /// one rather than whatever the app inherited.
     pub cwd: PathBuf,
-    /// The `DSH_HOME` the child is given.
+    /// The harness home the child is told to use (`DSH_HOME`).
     pub home: PathBuf,
-    /// The user's pnpm, when they named one; a default is a bare `pnpm`.
-    pub pnpm: PathBuf,
-}
-
-impl Launch {
-    /// A launch with no user-chosen pnpm, so `dsh plugin` finds only the bundle's.
-    pub fn without_pnpm(node: ResolvedNode, entry: PathBuf, cwd: PathBuf, home: PathBuf) -> Self {
-        Self {
-            node,
-            entry,
-            cwd,
-            home,
-            pnpm: PathBuf::from("pnpm"),
-        }
-    }
 }
 
 impl SupervisedChild {
     /// Spawn the launcher and wait for its readiness line.
     ///
-    /// `patch_files` become repeatable `--patch` overlays, which sit at the top
-    /// of the patch stack in argv order, so preset layers win over bundle and
-    /// profile layers without touching the profile's own patch file.
-    pub fn start(
-        preset: Preset,
-        launch: Launch,
-        patch_files: Vec<PathBuf>,
-        node_args: Vec<String>,
-    ) -> Result<Self, String> {
-        let Launch { node, entry, cwd, home, pnpm } = launch;
-        // Node's own flags precede the script; passing them as argv entries
-        // rather than through NODE_OPTIONS keeps the child environment clean
-        // (that variable is stripped from inherited state for the same reason).
-        let mut args: Vec<String> = node_args;
-        args.push(entry.display().to_string());
-        // Launcher flags must precede the first token the launcher does not
-        // know, because everything from there on belongs to the booted app.
-        args.push("--profile".to_owned());
-        args.push(preset.profile_name().to_owned());
-        for patch in &patch_files {
-            args.push("--patch".to_owned());
-            args.push(patch.display().to_string());
-        }
-        // App flags follow the launcher's.
-        args.push("--no-open".to_owned());
-        args.push("--port".to_owned());
-        args.push("0".to_owned());
+    /// The argv shape is the whole launcher contract: launcher flags
+    /// (`--profile`) precede the first token the launcher does not know, and
+    /// everything after that belongs to the booted app (`--no-open`, `--port`).
+    /// `--no-open` must be given, or dsh also opens the user's default browser.
+    pub fn start(profile: &str, launch: Launch) -> Result<Self, String> {
+        let Launch { dsh, cwd, home } = launch;
+        let args = [
+            "--profile".to_owned(),
+            profile.to_owned(),
+            "--no-open".to_owned(),
+            "--port".to_owned(),
+            "0".to_owned(),
+        ];
 
-        let mut child = Command::new(&node.path)
+        let mut child = Command::new(&dsh)
             .args(&args)
             .current_dir(&cwd)
             .env_clear()
-            .envs(child_environment(&home, &preset, &pnpm))
+            .envs(child_environment(&home))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("cannot spawn {}: {error}", node.path.display()))?;
+            .map_err(|error| format!("cannot spawn {}: {error}", dsh.display()))?;
 
         let stdout = child.stdout.take().ok_or("child stdout was not captured")?;
         let stderr = child.stderr.take().ok_or("child stderr was not captured")?;
@@ -213,10 +152,11 @@ impl SupervisedChild {
         let tail = Arc::new(Mutex::new(Vec::new()));
         {
             let tail = Arc::clone(&tail);
+            let tag = profile.to_owned();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    eprintln!("[dsh] {line}");
+                    eprintln!("[dsh:{tag}] {line}");
                     if let Ok(mut guard) = tail.lock() {
                         guard.push(line);
                         if guard.len() > STDERR_TAIL {
@@ -229,6 +169,7 @@ impl SupervisedChild {
 
         // stdout: forward and watch for the readiness line.
         let (sender, receiver) = mpsc::channel::<String>();
+        let tag = profile.to_owned();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -239,7 +180,7 @@ impl SupervisedChild {
                     Ok(_) => {}
                 }
                 let text = line.trim_end().to_owned();
-                eprintln!("[dsh] {text}");
+                eprintln!("[dsh:{tag}] {text}");
                 if parse_ready_line(&text).is_some() {
                     let _ = sender.send(text);
                 }
@@ -247,12 +188,9 @@ impl SupervisedChild {
         });
 
         let mut supervised = SupervisedChild {
-            preset,
-            node,
             child,
             phase: Phase::Starting,
             stderr_tail: tail,
-            patch_files,
         };
 
         match receiver.recv_timeout(READY_TIMEOUT) {
@@ -272,11 +210,6 @@ impl SupervisedChild {
             }
         }
         Ok(supervised)
-    }
-
-    /// The preset this child runs.
-    pub fn preset(&self) -> &Preset {
-        &self.preset
     }
 
     /// Poll the child so a crash becomes visible without an explicit check.
@@ -310,18 +243,8 @@ impl SupervisedChild {
     /// Current UI snapshot.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            preset_id: self.preset.id.clone(),
-            label: self
-                .preset
-                .label
-                .clone()
-                .unwrap_or_else(|| self.preset.id.clone()),
-            profile: self.preset.profile_name().to_owned(),
             phase: self.phase.clone(),
             stderr_tail: self.stderr_tail.lock().map(|guard| guard.clone()).unwrap_or_default(),
-            patch_files: self.patch_files.clone(),
-            node: self.node.path.clone(),
-            node_source: self.node.source.label(),
         }
     }
 
@@ -361,5 +284,76 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_readiness_line_is_parsed_leniently() {
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:51234/?token=abc"),
+            Some("http://127.0.0.1:51234/?token=abc".to_owned())
+        );
+        // Upstream appends a LAN suffix; the first token is the loopback URL.
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:51234/?token=abc (LAN: http://10.0.0.2:51234/)"),
+            Some("http://127.0.0.1:51234/?token=abc".to_owned())
+        );
+        assert_eq!(parse_ready_line("dsh web: not-a-url"), None);
+        assert_eq!(parse_ready_line("booting"), None);
+    }
+
+    /// The whole supervision path against a stub: the argv the launcher gets, the
+    /// readiness line, and a SIGTERM that actually stops it.
+    #[test]
+    fn a_child_that_announces_a_url_becomes_ready_and_then_stops() {
+        let dir = std::env::temp_dir().join(format!("dsh-app-supervisor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        let stub = dir.join("dsh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'dsh web: http://127.0.0.1:9/?token=stub'\nsleep 60\n",
+        )
+        .expect("the stub is writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let mut child = SupervisedChild::start(
+            "web",
+            Launch {
+                dsh: stub,
+                cwd: dir.clone(),
+                home: dir.join("home"),
+            },
+        )
+        .expect("the stub is spawnable");
+
+        match &child.phase {
+            Phase::Ready { url } => assert_eq!(url, "http://127.0.0.1:9/?token=stub"),
+            other => panic!("expected ready, got {other:?}"),
+        }
+        assert!(child.is_running());
+        child.shutdown();
+        assert!(!child.is_running());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The child must never inherit the variables the harness Electron shell also
+    /// strips, and must be told exactly one home: the one the shell resolved.
+    #[test]
+    fn the_environment_is_filtered_and_names_our_home() {
+        let env = child_environment(Path::new("/tmp/some-home"));
+        assert_eq!(env.get("DSH_HOME").map(String::as_str), Some("/tmp/some-home"));
+        assert!(!env.contains_key("NODE_OPTIONS"));
+        assert_eq!(env.keys().filter(|name| name.starts_with("DSH_")).count(), 1);
+        assert!(env.keys().all(|name| !name.to_ascii_lowercase().starts_with("npm_")));
     }
 }

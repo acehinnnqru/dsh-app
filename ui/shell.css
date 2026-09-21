@@ -52,7 +52,7 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
   user-select: text;
 }
 
-.presets {
+.profiles {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -61,8 +61,8 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
   gap: 10px;
 }
 
-/* The Node / pnpm form. It has to work with no runtime behind it, so it uses
-   nothing but the stylesheet compiled into the shell binary. */
+/* The dsh form. It has to work with no runtime behind it, so it uses nothing
+   but the stylesheet compiled into the shell binary. */
 .card {
   margin-bottom: 14px;
   padding: 14px;
@@ -149,46 +149,33 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.preset {
+.profile {
   padding: 12px 14px;
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 10px;
 }
 
-.preset-head {
+.profile-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
-.preset-title {
+.profile-title {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
 
-.preset-name {
+.profile-name {
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-/* Which kind of entry this is — a preset file or a discovered profile. Kept
-   quiet: it explains the list, it is not a status. */
-.tag {
-  flex: none;
-  padding: 1px 7px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font-size: 10.5px;
-  color: var(--muted);
-}
-
-.tag[data-origin="profile"] { border-style: dashed; }
 
 .badge {
   padding: 1px 8px;
@@ -199,12 +186,11 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
 }
 
 .badge[data-phase="ready"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
-.badge[data-phase="starting"],
-.badge[data-phase="materializing"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.badge[data-phase="starting"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 .badge[data-phase="failed"],
 .badge[data-phase="exited"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
 
-.preset-meta {
+.profile-meta {
   margin: 6px 0 4px;
   color: var(--muted);
   font-size: 11.5px;
@@ -212,7 +198,7 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
 
 /* The file or directory behind the row. Right-to-left so the ellipsis eats the
    leading directories and the last segment stays visible. */
-.preset-source {
+.profile-source {
   margin: 0 0 10px;
   color: var(--muted);
   overflow: hidden;
@@ -223,14 +209,14 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
   user-select: text;
 }
 
-.preset-note {
+.profile-note {
   margin: 0 0 10px;
   color: var(--warn);
   font-size: 11.5px;
   user-select: text;
 }
 
-.preset-actions { display: flex; gap: 8px; }
+.profile-actions { display: flex; gap: 8px; }
 
 button {
   padding: 5px 12px;
@@ -301,10 +287,3 @@ details pre {
   white-space: pre-wrap;
 }
 
-.runtime-actions { margin-top: 10px; }
-
-.update-note {
-  margin: 10px 0 0;
-  color: var(--muted);
-  font-size: 11.5px;
-}

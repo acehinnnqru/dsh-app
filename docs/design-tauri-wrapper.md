@@ -1,5 +1,10 @@
 # dsh-app — Tauri 包壳整体设计
 
+> ⚠️ **实现已收窄**：本文档描述的"运行时来源"部分（D2、D7–D10、种子闭包、更新通道、
+> 变体轴）已被 [spec-external-dsh.md](spec-external-dsh.md) 取代 —— 壳不再自带任何运行时，
+> 只负责启动用户指定的 `dsh`。仍然成立的是 D1（载体）、D5（进程与生命周期）、
+> D6（壳与运行时的契约）与 §21/§22（launcher 定位）。
+>
 > 状态：设计草案 v2（待评审）。阶段一评审通过后再进入实现。
 > 上游事实来源：`/Users/rqc/r/github.com/deepseek-ai/deepseek-harness` @ 本地 checkout（含只读审计报告 `docs/research/dsh-process-audit.md`）。
 > 平台事实来源：Tauri v2 调研报告 `docs/research/tauri-v2-desktop-shell-research.md`（2026-09-16 基线，见附录 A）。

@@ -14,79 +14,66 @@
       <header>
         <h1>DeepSeek Harness</h1>
         <button id="reload" type="button" class="ghost"
-                title="Re-read preset files and profiles">Reload list</button>
+                title="Re-read the profile list from the harness home">Reload list</button>
       </header>
 
       <section id="fatal" class="problems" hidden></section>
       <section id="problems" class="problems" hidden></section>
 
-      <!-- Rendered by the shell page, not by the runtime: a `slim` build has no
-           Node until this is filled in, so the runtime cannot be the one asking. -->
+      <!-- Rendered by the shell page, not by the runtime: this app ships no
+           runtime of its own, so nothing else is there to ask the question. -->
       <section id="config" class="card" hidden>
-        <h2 id="config-title">Runtime</h2>
+        <h2 id="config-title">A dsh executable is required</h2>
         <p id="config-hint" class="config-hint"></p>
 
         <label class="field">
-          <span class="field-label">Node path <em>required</em></span>
-          <input id="node-path" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="/opt/homebrew/bin/node" />
-          <span id="node-status" class="field-status"></span>
+          <span class="field-label">dsh path <em>required</em></span>
+          <input id="dsh-path" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="/opt/homebrew/bin/dsh" />
+          <span id="dsh-status" class="field-status"></span>
         </label>
 
         <label class="field">
-          <span class="field-label">pnpm path <em>optional</em></span>
-          <input id="pnpm-path" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="/opt/homebrew/bin/pnpm" />
-          <span id="pnpm-status" class="field-status"></span>
+          <span class="field-label">Harness home <em>required</em></span>
+          <input id="dsh-home" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="~/.dsh" />
+          <span id="home-status" class="field-status"></span>
         </label>
 
         <div class="config-actions">
           <button id="config-save" type="button">Validate and save</button>
           <span class="config-note">
-            Use a Node from nodejs.org: a distribution-repackaged build can load the
-            <code>require-builtin</code> addon and then refuse every id, which breaks
-            <code>patchReload: live</code>.
+            Run <code>which dsh</code> in a terminal for the first field. The home is where
+            profiles, sessions, and credentials live, and it is shared with the
+            <code>dsh</code> CLI — leave it at <code>~/.dsh</code> unless you keep your
+            harness somewhere else.
           </span>
         </div>
       </section>
 
-      <ul id="presets" class="presets"></ul>
+      <ul id="profiles" class="profiles"></ul>
 
       <p id="empty" class="empty" hidden>
         No profiles found. Create one with the <code>dsh</code> CLI
         (<code>dsh --profile web</code>, or
         <code>dsh plugin --profile NAME add PACKAGE</code>), then press
-        <em>Reload list</em>. A preset file under <code>dsh-app/presets/</code> is only
-        needed for extra patch layers, a specific Node, or environment additions.
+        <em>Reload list</em>.
       </p>
 
       <details class="facts-wrap">
         <summary>Runtime</summary>
         <dl class="facts">
-          <dt>Active</dt>
-          <dd id="fact-active" class="mono">—</dd>
           <dt>dsh</dt>
           <dd id="fact-dsh" class="mono">—</dd>
-          <dt>Previous</dt>
-          <dd id="fact-previous" class="mono">—</dd>
-          <dt>Node</dt>
-          <dd id="fact-node" class="mono">—</dd>
+          <dt>Chosen by</dt>
+          <dd id="fact-dsh-source" class="mono">—</dd>
           <dt>Home</dt>
           <dd id="fact-home" class="mono">—</dd>
-          <dt>Channel</dt>
-          <dd id="fact-channel" class="mono">—</dd>
+          <dt>Settings</dt>
+          <dd id="fact-settings" class="mono">—</dd>
           <dt>Shell</dt>
           <dd id="fact-ui" class="mono">—</dd>
         </dl>
-        <p id="update-note" class="update-note" hidden></p>
-        <div class="actions runtime-actions">
-          <button id="check-update" type="button"
-                  title="Ask the channel whether a newer runtime exists">Check for updates</button>
-          <button id="apply-update" type="button" disabled
-                  title="Download, verify, and activate the newest runtime">Install update</button>
-          <button id="rollback" type="button" disabled
-                  title="Switch back to the previous runtime">Roll back runtime</button>
-        </div>
       </details>
     </main>
     <script type="module" src="shell.js"></script>
