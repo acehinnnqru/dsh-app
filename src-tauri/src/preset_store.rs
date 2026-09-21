@@ -10,7 +10,12 @@
 //! configuration on its own, so it is listed as it is instead of being restated
 //! as a preset (design doc §21).
 //!
-//! @see docs/design-tauri-wrapper.md D3, §21
+//! It ships nothing of its own: no default preset is written and no sample is
+//! seeded into a fresh home. A launcher lists what is there and starts what the
+//! user picks, while creating a profile stays with the harness and the user
+//! (design doc §22).
+//!
+//! @see docs/design-tauri-wrapper.md D3, §21, §22
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -22,9 +27,6 @@ use crate::profile::{self, DiscoveredProfile};
 
 /// Directory holding preset files, under the shell's own home.
 pub const PRESETS_DIR: &str = "dsh-app/presets";
-
-/// The preset file written on first run so a fresh install is self-explanatory.
-const DEFAULT_PRESET_ID: &str = "dsh-app";
 
 /// One preset as stored on disk.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,8 +88,8 @@ pub struct ResolvedPreset {
 /// rows starting the same profile would be two ways to do one thing. Rows are
 /// keyed by id — the child map and the harness window label both use it — so a
 /// profile whose name a preset already uses as its id is skipped as well.
-pub fn load_all_with_profiles(home: &Path, seed: Option<&Path>) -> (Vec<ResolvedPreset>, Vec<String>) {
-    let (mut entries, mut problems) = load_all(home, seed);
+pub fn load_all_with_profiles(home: &Path) -> (Vec<ResolvedPreset>, Vec<String>) {
+    let (mut entries, mut problems) = load_all(home);
     let (profiles, profile_problems) = profile::discover(home);
     problems.extend(profile_problems);
 
@@ -129,32 +131,18 @@ fn from_profile(profile: DiscoveredProfile) -> ResolvedPreset {
     }
 }
 
-/// Load every preset from `<home>/dsh-app/presets/`, writing the default first.
+/// Load every preset from `<home>/dsh-app/presets/`.
 ///
-/// A malformed preset file is reported rather than skipped: a silently ignored
-/// preset would look like the shell lost the user's configuration.
-///
-/// `seed` is a directory to copy in on first run (the packaged app seeds its
-/// own sample presets this way). Existing files are never overwritten, so a
-/// seeded preset stops being ours the moment the user edits it.
-pub fn load_all(home: &Path, seed: Option<&Path>) -> (Vec<ResolvedPreset>, Vec<String>) {
+/// An empty directory is a normal state rather than a first run waiting to be
+/// filled in: the shell writes no preset of its own (design doc §22). A
+/// malformed preset file is reported rather than skipped, because a silently
+/// ignored preset would look like the shell lost the user's configuration.
+pub fn load_all(home: &Path) -> (Vec<ResolvedPreset>, Vec<String>) {
     let dir = home.join(PRESETS_DIR);
     let mut problems = Vec::new();
     if let Err(error) = std::fs::create_dir_all(&dir) {
         problems.push(format!("cannot create {}: {error}", dir.display()));
         return (Vec::new(), problems);
-    }
-    if let Some(seed) = seed {
-        if let Err(error) = seed_missing(seed, &dir) {
-            problems.push(error);
-        }
-    }
-
-    let default_path = dir.join(format!("{DEFAULT_PRESET_ID}.toml"));
-    if !default_path.exists() {
-        if let Err(error) = std::fs::write(&default_path, default_preset_text()) {
-            problems.push(format!("cannot write {}: {error}", default_path.display()));
-        }
     }
 
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -219,82 +207,6 @@ pub fn load_one(path: &Path) -> Result<ResolvedPreset, String> {
     })
 }
 
-/// Copy seed entries that do not exist yet, recursively.
-///
-/// Presets may reference patch files beside themselves, so the whole tree is
-/// mirrored and not just the `.toml` files.
-fn seed_missing(from: &Path, to: &Path) -> Result<(), String> {
-    let entries = match std::fs::read_dir(from) {
-        Ok(entries) => entries,
-        // No seed directory is not a problem: a packaged app may ship none.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot read the preset seed {}: {error}", from.display())),
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        if target.exists() {
-            continue;
-        }
-        if source.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
-            seed_missing(&source, &target)?;
-            continue;
-        }
-        std::fs::copy(&source, &target)
-            .map_err(|error| format!("cannot seed {}: {error}", target.display()))?;
-    }
-    Ok(())
-}
-
-/// The default preset's contents, written on first run.
-fn default_preset_text() -> String {
-    format!(
-        "# One dsh-app preset. Every field maps onto an existing dsh concept:\n\
-         #   profile -> `--profile`   patches -> `--patch`   env -> the child environment\n\
-         #\n\
-         # kind = \"web\"      the served GUI opens in its own window (implemented)\n\
-         # kind = \"task\"     one-shot; `job` is the positional argument (not implemented)\n\
-         # kind = \"server\"   long-lived stdio, no window (not implemented)\n\
-         #\n\
-         # patch_reload = \"startup\" needs nothing extra; \"live\" adds the HMR row and\n\
-         # therefore requires internals access (`--expose-internals` or the native addon).\n\
-         \n\
-         id = \"{DEFAULT_PRESET_ID}\"\n\
-         label = \"Default\"\n\
-         kind = \"web\"\n\
-         profile = \"{DEFAULT_PRESET_ID}\"\n\
-         patch_reload = \"startup\"\n\
-         \n\
-         # Bundles are written into the profile only on its first materialization;\n\
-         # after that the profile directory belongs to you.\n\
-         bundles = [\"@deepseek-ai/dsh-base\", \"@deepseek-ai/dsh-web-app\"]\n\
-         \n\
-         # Extra patch layers, applied in order on top of every bundle and profile\n\
-         # layer (this is dsh's `--patch`, so a layer wins over the layers below it).\n\
-         # Each file is a top-level YAML array of id-targeted patch entries, e.g.\n\
-         #   - id: webserver\n\
-         #     config: {{ host: 127.0.0.1, port: 45671 }}\n\
-         # NOTE: `config` REPLACES the target row's whole config object; it is not a\n\
-         # deep merge, so a patch must repeat every required field of that row.\n\
-         # patches = [\"patch.d/10-example.yml\"]\n\
-         \n\
-         # The Node runtime to run this preset with. Leave it out to use the one the\n\
-         # app carries (`bundled` variant) or `DSH_APP_NODE`.\n\
-         #\n\
-         # It is an explicit path on purpose: an app started from Finder does not\n\
-         # inherit your shell's PATH — it sees only /usr/bin:/bin:/usr/sbin:/sbin —\n\
-         # so auto-detection would choose from an environment you did not set up.\n\
-         # Point it at a Node from nodejs.org: distribution-repackaged builds can\n\
-         # load the `require-builtin` addon and then refuse every id, which breaks\n\
-         # `patch_reload = \"live\"`.\n\
-         # node = \"/opt/homebrew/bin/node\"\n\
-         \n\
-         [env]\n"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,15 +254,16 @@ mod tests {
         }
     }
 
-    /// The store writes a default preset on first run, and that preset claims
-    /// the `dsh-app` profile: one profile must not become two rows.
+    /// A preset the user wrote owns its profile: one profile must not become
+    /// two rows.
     #[test]
     fn a_declared_preset_owns_its_profile() {
         let home = TempHome::new("store-dedup");
+        home.preset("dsh-app", "dsh-app");
         home.profile("dsh-app", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
         home.profile("demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
 
-        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        let (entries, problems) = load_all_with_profiles(home.path());
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
@@ -365,7 +278,7 @@ mod tests {
         let home = TempHome::new("store-declaration");
         home.profile("demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
 
-        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        let (entries, problems) = load_all_with_profiles(home.path());
         assert!(problems.is_empty(), "{problems:?}");
         let demo = entries
             .iter()
@@ -393,12 +306,33 @@ mod tests {
         home.profile("demo", &[preset::WEB_BUNDLE], None);
         home.profile("other", &[preset::WEB_BUNDLE], None);
 
-        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        let (entries, problems) = load_all_with_profiles(home.path());
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
-            ["demo", "dsh-app", "other"]
+            ["demo", "other"]
         );
+    }
+
+    /// The shell ships no preset of its own: a fresh home stays empty until the
+    /// user puts something there (design doc §22).
+    #[test]
+    fn a_fresh_home_gets_no_preset_from_us() {
+        let home = TempHome::new("store-no-default");
+        home.profile("web", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
+
+        let (entries, problems) = load_all_with_profiles(home.path());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
+            ["web"]
+        );
+        let written: Vec<String> = std::fs::read_dir(home.path().join(PRESETS_DIR))
+            .expect("the preset directory exists")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(written.is_empty(), "the shell wrote {written:?} into the user's home");
     }
 
     #[test]
@@ -409,11 +343,11 @@ mod tests {
         home.profile("gamma", &[preset::WEB_BUNDLE], None);
         home.profile("delta", &[preset::WEB_BUNDLE], None);
 
-        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        let (entries, problems) = load_all_with_profiles(home.path());
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
-            ["alpha", "dsh-app", "zulu", "delta", "gamma"]
+            ["alpha", "zulu", "delta", "gamma"]
         );
     }
 }

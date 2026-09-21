@@ -10,7 +10,6 @@
 //! Cache busting is handled by the page's own `no-store` directive, because the
 //! asset protocol strips query strings and sets no headers of its own.
 
-use std::path::Path;
 use std::process::Command;
 
 /// The shell page files whose contents define the stamped identity.
@@ -24,44 +23,8 @@ const UI_FILES: [&str; 5] = [
 
 fn main() {
     println!("cargo:rerun-if-changed=../ui");
-    println!("cargo:rerun-if-changed=presets");
     println!("cargo:rustc-env=DSH_APP_UI_VERSION={}", ui_version());
-    copy_seed_presets();
     tauri_build::build()
-}
-
-/// Copy the sample presets into `OUT_DIR`, where the shell reads them from.
-///
-/// A compile-time path beats deriving one from the executable: `target/<profile>/`
-/// and a bundle's `Contents/MacOS` sit at different depths, and guessing wrong
-/// would silently seed nothing.
-fn copy_seed_presets() {
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
-    let target = Path::new(&out_dir).join("seed-presets");
-    let source = Path::new("presets");
-    if !source.is_dir() {
-        return;
-    }
-    let _ = std::fs::remove_dir_all(&target);
-    if let Err(error) = copy_dir(source, &target) {
-        // A missing seed is not fatal; the shell writes its own default preset.
-        println!("cargo:warning=could not stage sample presets: {error}");
-    }
-}
-
-/// Recursively copy `from` into `to`.
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)?.filter_map(Result::ok) {
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        if source.is_dir() {
-            copy_dir(&source, &target)?;
-        } else {
-            std::fs::copy(&source, &target)?;
-        }
-    }
-    Ok(())
 }
 
 /// A content hash of the shell page, or a timestamp when hashing is unavailable.

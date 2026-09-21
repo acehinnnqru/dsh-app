@@ -963,7 +963,8 @@ dsh web: http://127.0.0.1:45677    ← second（patch 固定的端口）
   引用**相对自己**的补丁，所以 `patch.d/` 必须一起落到 home。`build.rs` 把 `src-tauri/presets/`
   拷进 `OUT_DIR/seed-presets/`（编译期常量路径——从可执行文件上溯推路径在 `target/<profile>/` 与
   `Contents/MacOS/` 下深度不同，猜错就会静默不 seed），首次运行 `seed_missing()` 只补缺失文件，
-  用户改过就不再覆盖。
+  用户改过就不再覆盖。→ **§22 已删除这套 seed**：壳不再往 home 里放任何 preset，
+  示例留在 `src-tauri/presets/`（附 README），要用自己拷。
 
 ### 13.2 待处理的两个小问题
 
@@ -1432,6 +1433,57 @@ preset 的 `profile` 指向哪个 profile，那个 profile 就不再单独列一
 | `cargo build` | 与改动前同样 9 条 warning（都是既有的 dead-code） |
 | 打包态实测（`sign-app.sh bundled` 的产物 + 一份指向真实 profile 的隔离 home） | 列表 6 行：2 个 preset（`Default`/`Second`）+ `au-web`/`demo`/`desktop`/`web`；`dsh-app` 只出现一次；6 行全部 `idle`、`url` 为空、无任何子进程（确认不再自动启动）；`problems` 为空 |
 | 签名与冒烟（同一产物） | 13 个 Mach-O + app 带 `TeamIdentifier=XQYB6GQJJ5`，`--verify --deep --strict` 通过，种子冒烟通过（node / pnpm / web 三件事都没被这次改动碰到） |
+
+## 22. 壳不建 profile，也没有默认 preset（launcher 定位）
+
+§21 让列表能列出用户自己的 profile 之后，"壳自带一个默认 preset、第一次 Start 时再物化一份
+自己的 profile"就只剩代价了。
+
+**用户的话**：不需要 default，也不需要生成我们自己的 profile；我们是一个壳，定位是 launcher，
+进来能看到用户的 profiles，他自己选要用哪个。
+
+### 22.1 删掉的三样
+
+| 删掉 | 原来在哪 | 为什么 |
+|---|---|---|
+| 默认 preset（`dsh-app.toml`，label `Default`） | `preset_store::default_preset_text`，每次加载发现缺失就写 | 它让列表有两个来源：用户的 profile，和壳自己造的一行 |
+| 示例 preset 的 seed（`second.toml` + `patch.d/`） | `build.rs` 暂存到 `OUT_DIR/seed-presets`，`seed_missing()` 首次运行拷进 home | 壳往用户的 home 里放自己发明的条目，而它们指向并不存在的 profile（`dsh-app-second`），Start 时又把这个 profile 造出来 |
+| `preset_seed_dir()` / `seed_missing()` / `default_preset_text()` / build.rs 的 staging | 同上 | 没有调用者了 |
+
+示例仍留在仓库里（`src-tauri/presets/`，附 README）；想用的人自己拷进
+`~/.dsh/dsh-app/presets/`。
+
+### 22.2 上游的规则本来就支持这个定位
+
+`@deepseek-ai/dsh-app-boot` 的 `loadProfile`：名字在 `PROFILE_TEMPLATES`
+（web / headless / acp / sdk / sdk-minimal）里且 profile 不存在时，**harness 自己**初始化；不在
+表里的名字不存在就直接报错——`profile "X" does not exist; create it with 'dsh plugin --profile X add <package>'`。
+而唯一被独占的名字是 `desktop`，那是上游保留给 Electron 的（`dsh/lib/bin.js`：
+`profile "desktop" is managed exclusively by the Electron application`）。
+
+结论：**profile 的创建权在上游和用户手里，壳不该插一脚**。壳只要 `dsh --profile <name>`
+起进程；模板名的 profile 该建的时候 harness 会自己建。
+
+### 22.3 还留着的一个写入口（有意的）
+
+preset 的 `profile` 指向一个**不存在**的 profile 时，第一次 Start 仍会由
+`profile::materialize` 建出来（D3 / §11.5 的契约：preset 是用户写的声明，`bundles`
+是"首次物化时写什么"）。区别是：现在没有任何 preset 是壳带来的，所以这条路径只在用户自己写了
+preset 之后才会走到。要彻底到"壳永不写 `profiles/`"，删掉那次调用即可。
+
+### 22.4 升级注意
+
+装过旧版本的机器上，`~/.dsh/dsh-app/presets/dsh-app.toml`（以及可能存在的
+`second.toml`、`patch.d/`）**不会**被删——壳不删用户的文件。不想要就自己删：
+`rm ~/.dsh/dsh-app/presets/dsh-app.toml`，之后壳不会再写它。已经建出来的
+`profiles/dsh-app/` 就当成一份普通 profile 留在列表里。
+
+### 22.5 实测
+
+| 检查项 | 结果 |
+|---|---|
+| `cargo test` | 28 项通过（新增 1 项：空 home 不写任何 preset；其余为 §21 的发现/去重/顺序用例） |
+| 打包态实测（签名后的 app + 指向真实 profiles 的隔离 home） | 5 行全部 `origin=profile`（au-web / demo / desktop / dsh-app / web），没有任何壳自造的条目；`dsh-app/presets/` 运行前后都是 0 个文件；无子进程（不自动启动）；problems 为空 |
 
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 

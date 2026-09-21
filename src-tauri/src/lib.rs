@@ -668,12 +668,6 @@ fn record_problem(app: &tauri::AppHandle, message: String) {
     );
 }
 
-/// Sample presets staged by `build.rs`, seeded into the home on first run.
-fn preset_seed_dir() -> Option<PathBuf> {
-    let staged = PathBuf::from(env!("OUT_DIR")).join("seed-presets");
-    staged.is_dir().then_some(staged)
-}
-
 /// Lock the shell state, converting a poisoned mutex into a readable error.
 fn lock_state<'a>(state: &'a tauri::State<'_, Mutex<ShellState>>) -> Result<MutexGuard<'a, ShellState>, String> {
     state
@@ -787,7 +781,7 @@ fn stop_preset(
 fn reload_presets(state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), String> {
     let mut state = lock_state(&state)?;
     let home = state.config.home.clone();
-    let (presets, problems) = preset_store::load_all_with_profiles(&home, preset_seed_dir().as_deref());
+    let (presets, problems) = preset_store::load_all_with_profiles(&home);
     state.presets = presets;
     state.problems = problems;
     Ok(())
@@ -1189,7 +1183,7 @@ pub fn run() {
         }
     };
 
-    let (presets, preset_problems) = preset_store::load_all_with_profiles(&config.home, preset_seed_dir().as_deref());
+    let (presets, preset_problems) = preset_store::load_all_with_profiles(&config.home);
     problems.extend(preset_problems);
 
     let app = tauri::Builder::default()
@@ -1279,6 +1273,14 @@ mod tests {
         std::fs::write(dir.join("package.json"), manifest.to_string()).expect("write the manifest");
     }
 
+    /// Write one preset file, the way a user would.
+    fn write_preset(home: &Path, id: &str, profile: &str) {
+        let dir = home.join(preset_store::PRESETS_DIR);
+        std::fs::create_dir_all(&dir).expect("create the preset directory");
+        let text = format!("id = \"{id}\"\nlabel = \"{id}\"\nprofile = \"{profile}\"\n");
+        std::fs::write(dir.join(format!("{id}.toml")), text).expect("write the preset");
+    }
+
     /// The page renders this payload and nothing else, so its shape is the
     /// contract: one row per launchable thing, each saying where it came from
     /// and — when it cannot start — why (design doc §21).
@@ -1287,13 +1289,14 @@ mod tests {
         let home = std::env::temp_dir().join(format!("dsh-app-payload-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create the test home");
-        // `dsh-app` is owned by the default preset the store writes, `demo` and
-        // `base` are not owned by anything.
-        write_profile(&home, "dsh-app", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
+        // A preset the user wrote claims `demo`; `au` and `base` belong to no preset, so
+        // they are listed as profiles.
+        write_preset(&home, "work", "demo");
         write_profile(&home, "demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
+        write_profile(&home, "au", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
         write_profile(&home, "base", &["@deepseek-ai/dsh-base"], None);
 
-        let (presets, problems) = preset_store::load_all_with_profiles(&home, None);
+        let (presets, problems) = preset_store::load_all_with_profiles(&home);
         assert!(problems.is_empty(), "{problems:?}");
         let state = ShellState {
             config: AppConfig {
@@ -1313,26 +1316,26 @@ mod tests {
         let payload = state.snapshot();
         let rows = payload["presets"].as_array().expect("presets is a list");
         let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap_or_default()).collect();
-        assert_eq!(ids, ["dsh-app", "base", "demo"]);
+        assert_eq!(ids, ["work", "au", "base"]);
 
         // The declared preset comes first and starts normally.
         assert_eq!(rows[0]["origin"], "preset");
         assert_eq!(rows[0]["kind"], "web");
+        assert_eq!(rows[0]["profile"], "demo");
         assert_eq!(rows[0]["startNote"], serde_json::Value::Null);
+        // A discovered profile is startable and keeps its own reload mode.
+        assert_eq!(rows[1]["origin"], "profile");
+        assert_eq!(rows[1]["profile"], "au");
+        assert_eq!(rows[1]["startNote"], serde_json::Value::Null);
         // A profile whose bundles carry no GUI is listed, and says why it cannot
         // start, instead of promising a window it would never open (D3.3).
-        assert_eq!(rows[1]["origin"], "profile");
-        assert_eq!(rows[1]["kind"], "none");
-        assert!(
-            rows[1]["startNote"].as_str().unwrap_or_default().contains("no @deepseek-ai/dsh-web-app bundle"),
-            "{}",
-            rows[1]["startNote"]
-        );
-        // A discovered profile is startable and keeps its own reload mode.
         assert_eq!(rows[2]["origin"], "profile");
-        assert_eq!(rows[2]["profile"], "demo");
-        assert_eq!(rows[2]["patchReload"], "live");
-        assert_eq!(rows[2]["startNote"], serde_json::Value::Null);
+        assert_eq!(rows[2]["kind"], "none");
+        assert!(
+            rows[2]["startNote"].as_str().unwrap_or_default().contains("no @deepseek-ai/dsh-web-app bundle"),
+            "{}",
+            rows[2]["startNote"]
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

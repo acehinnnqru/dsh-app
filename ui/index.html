@@ -53,9 +53,11 @@
       <ul id="presets" class="presets"></ul>
 
       <p id="empty" class="empty" hidden>
-        No presets and no profiles found. Add a preset file under
-        <code>dsh-app/presets/</code>, or create a profile with the <code>dsh</code> CLI,
-        then press <em>Reload list</em>.
+        No profiles found. Create one with the <code>dsh</code> CLI
+        (<code>dsh --profile web</code>, or
+        <code>dsh plugin --profile NAME add PACKAGE</code>), then press
+        <em>Reload list</em>. A preset file under <code>dsh-app/presets/</code> is only
+        needed for extra patch layers, a specific Node, or environment additions.
       </p>
 
       <details class="facts-wrap">
