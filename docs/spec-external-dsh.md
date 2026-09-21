@@ -389,8 +389,42 @@ harness 的解析器（`@deepseek-ai/dsh-home-paths`：`join(homedir(), ".dsh")`
     1 profile(s) listed, configured: true, page error: null
     $fake/.dsh 根本没有被创建                  ← 壳不碰它不驱动的 home
 
-**没被覆盖的一格**：GUI 里按下 Start 之后那条完整路径（`start_profile` → 真实 dsh → 弹窗）
-没有脚本化验证；它由 `cargo test` 里的 stub 子进程测试与手工 argv 实测各覆盖一半。
+### 13.5 Start 按钮点不动：两个 bug，以及"必须能自己按按钮"的教训
 
-**坑**：`cargo test` 不重建 `target/debug/dsh-app`。改完 `ui/` 只跑测试、直接运行旧二进制，
-WebView 里会是**上一版页面**报的错（行号对不上就是信号）。改 UI 之后必须 `cargo build`。
+上面那句"没被覆盖的一格"是错的态度 —— 用户第一次手动测试时 Start 毫无反应，而这条路径里
+藏着**两个**独立 bug，都是这次实现引入的：
+
+| # | bug | 症状 |
+|---|---|---|
+| 1 | 页面 `invoke('start_profile')`，Rust 注册的是 `start_profile_command` | 命令不存在 → promise reject → 点击处理没有 catch → **完全静默** |
+| 2 | `spawn_profile` 里写成 `resolve_global_dsh(&config.home)`，把**驱动的 home** 当成**壳的配置目录** | `config.toml` 读不到 → 解析成 Unconfigured → 走一个**没有日志**的分支返回 → 照样静默 |
+
+bug 2 尤其阴：`snapshot()` 用的是正确的目录（所以界面显示"已配置"、列表正常），只有启动
+路径用错字段 —— 界面说"我准备好了"，点下去什么也不发生。
+
+处置：命令名不再有 `_command` 后缀；页面用 `act()` 包住所有 host 调用，reject 一律显示出来；
+新增两个测试 —— `every_command_the_page_invokes_is_registered`（扫 `#[tauri::command]` 声明，
+不维护第二份名单）与 `a_start_resolves_the_executable_from_the_config_directory`（钉死字段选择）。
+
+### 13.6 自测开关：`DSH_APP_SELFTEST`
+
+教训是**这个壳没有终端，手点不能作为唯一的验证手段**。所以 `DSH_APP_DEBUG_STATE=1` 的
+page-probe 扩展了一个开关：
+
+    DSH_APP_DEBUG_STATE=1 DSH_APP_SELFTEST=web ./dsh-app
+
+它让页面自己去 invoke `start_profile`，然后轮询 `shell_state` 直到 ready/failed，把
+结果通过 `ui_probe` 打回 stderr：
+
+    [dsh-app] starting profile web with /etc/profiles/per-user/rqc/bin/dsh (settings)
+    [dsh:web] dsh web: http://127.0.0.1:59554/?token=…
+    page-probe {"selftest":"invoked","phase":"ready","url":"http://127.0.0.1:59554/?token=…"}
+
+bug 2 就是被它抓出来的 —— 手工点按钮时，`selftest: "invoked"` + `phase: "still-starting"`
+这一组合直接指向"命令返回值正常但线程里静默返回了"。命令行下的 GUI，这条通道比截图有用。
+
+### 13.7 坑
+
+`cargo test` **不重建** `target/debug/dsh-app`。改完 `ui/` 或 `lib.rs` 只跑测试、
+直接运行旧二进制，看到的还是上一版行为（本文件 §13.4 记过一次，实现过程中又踩了一次）。
+改完必须 `cargo build`，或者干脆 `cargo build && cargo test` 一起跑。

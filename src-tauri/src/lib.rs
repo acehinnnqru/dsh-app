@@ -141,6 +141,17 @@ fn resolve_global_dsh(config_dir: &Path) -> Result<config::DshResolution, String
     config::resolve_dsh(&report.settings)
 }
 
+/// The executable one Start will use.
+///
+/// Reads the shell's **own** config directory, never the harness home it drives.
+/// The two are different directories, and reading the wrong one does not fail
+/// loudly: `settings::load` treats a missing file as "unconfigured", so the
+/// start resolves to nothing and the button does nothing at all. That is exactly
+/// what happened, so the field choice is pinned by a test.
+fn launch_dsh(config: &AppConfig) -> Result<config::DshResolution, String> {
+    resolve_global_dsh(&config.config_dir)
+}
+
 /// What the UI shows about the executable this shell will launch.
 ///
 /// `value: None` means **unconfigured**, which is a state and not a failure; a
@@ -478,8 +489,10 @@ fn fail_profile(app: &tauri::AppHandle, message: &str) {
 /// Spawn the launcher for `profile_id` and, once ready, open its window.
 ///
 /// Runs on a worker thread: booting dsh takes seconds and must not block the
-/// event loop that draws the window.
-fn start_profile(app: tauri::AppHandle, profile_id: String) {
+/// event loop that draws the window. The command name is the one the page
+/// invokes — no `_command` suffix, because a mismatch between the two halves of
+/// the IPC surface cannot be type-checked and would show up as a dead button.
+fn spawn_profile(app: tauri::AppHandle, profile_id: String) {
     std::thread::spawn(move || {
         let handle = app.state::<Mutex<ShellState>>();
         let config = {
@@ -504,7 +517,7 @@ fn start_profile(app: tauri::AppHandle, profile_id: String) {
             state.config.clone()
         };
 
-        let resolved = match resolve_global_dsh(&config.home) {
+        let resolved = match launch_dsh(&config) {
             Ok(config::DshResolution::Configured(dsh)) => dsh,
             // Not an error: the shell is waiting for the user to name an
             // executable. Say where to do it instead of showing a failure.
@@ -586,8 +599,8 @@ fn start_profile(app: tauri::AppHandle, profile_id: String) {
 
 /// Start one profile from the UI.
 #[tauri::command]
-fn start_profile_command(app: tauri::AppHandle, profile_id: String) -> Result<(), String> {
-    start_profile(app, profile_id);
+fn start_profile(app: tauri::AppHandle, profile_id: String) -> Result<(), String> {
+    spawn_profile(app, profile_id);
     Ok(())
 }
 
@@ -638,6 +651,48 @@ fn install_page_probe(app: &tauri::AppHandle) {
     "#;
     let injected = window.eval(probe);
     eprintln!("[dsh-app] page-probe injected: {}", injected.is_ok());
+
+    // `DSH_APP_SELFTEST=<profile>` drives one Start from the page and reports
+    // what the page saw. A launcher is a GUI with no terminal, so the only way
+    // to exercise "the button really starts something" from a script is to have
+    // the page press it — and without this, a broken IPC surface looks exactly
+    // like a button that was never clicked.
+    if let Ok(wanted) = std::env::var("DSH_APP_SELFTEST") {
+        if !wanted.trim().is_empty() {
+            let quoted = serde_json::to_string(wanted.trim()).unwrap_or_else(|_| "\"\"".to_owned());
+            let script = format!(
+                r#"
+      (async () => {{
+        const call = window.__TAURI_INTERNALS__.invoke;
+        const seen = {{ selftest: 'starting' }};
+        try {{
+          await call('start_profile', {{ profileId: {quoted} }});
+          seen.selftest = 'invoked';
+        }} catch (error) {{
+          seen.selftest = 'rejected: ' + String(error);
+        }}
+        for (let i = 0; i < 25; i += 1) {{
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          try {{
+            const now = await call('shell_state');
+            const row = (now.profiles || []).find((entry) => entry.id === {quoted});
+            if (row && (row.phase === 'ready' || row.phase === 'failed' || row.phase === 'exited')) {{
+              seen.phase = row.phase;
+              seen.url = row.url;
+              seen.tail = (row.stderrTail || []).slice(-6);
+              break;
+            }}
+          }} catch (error) {{ seen.poll = String(error); }}
+        }}
+        seen.phase = seen.phase || 'still-starting';
+        await call('ui_probe', {{ marker: JSON.stringify(seen) }}).catch(() => {{}});
+      }})()
+    "#
+            );
+            let _ = window.eval(script);
+            eprintln!("[dsh-app] page-selftest injected for {wanted}");
+        }
+    }
 }
 
 /// Build and run the shell.
@@ -698,7 +753,7 @@ pub fn run() {
             ui_probe,
             open_harness,
             stop_profile,
-            start_profile_command,
+            start_profile,
             reload_profiles,
             save_settings
         ])
@@ -794,6 +849,73 @@ mod tests {
             name: name.to_owned(),
             dir: PathBuf::from("/tmp").join(name),
             bundles: bundles.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    /// A start resolves the executable from the shell's config directory, not
+    /// from the home it drives. When those were confused the start silently
+    /// became "unconfigured" — no error, no process, just a dead button.
+    #[test]
+    fn a_start_resolves_the_executable_from_the_config_directory() {
+        let config_dir = TempHome::new("start-config-dir");
+        let driven_home = TempHome::new("start-driven-home");
+        let dsh = config_dir.fake_dsh("dsh", "0.1.6-alpha.2");
+        // The config names the executable and drives a home that has no config of
+        // its own — the shape that used to resolve to nothing.
+        settings::save(
+            config_dir.path(),
+            &dsh.display().to_string(),
+            &driven_home.path().display().to_string(),
+        )
+        .expect("the save succeeds");
+
+        let config = config::load(config_dir.path());
+        assert_eq!(config.config_dir, config_dir.path());
+        // Which directory the driven home resolves to depends on the session
+        // (DSH_HOME wins), so the invariant asserted here is the one that
+        // matters: the two roles are different directories and must not be
+        // confused for one another.
+        assert_ne!(config.home, config.config_dir);
+        assert!(
+            !config.home.join("config.toml").exists(),
+            "the driven home has no config of its own, which is what made the mistake silent"
+        );
+        match launch_dsh(&config) {
+            Ok(config::DshResolution::Configured(resolved)) => assert_eq!(resolved.path, dsh),
+            other => panic!("a start must find the configured executable, got {other:?}"),
+        }
+    }
+
+    /// The IPC surface has two halves that cannot be checked against each other:
+    /// the `invoke('…')` calls in the page, and the commands registered below.
+    /// A mismatch is invisible — the button simply does nothing — so it is
+    /// asserted here instead. The command list is read out of this file rather
+    /// than restated, so it cannot go stale.
+    #[test]
+    fn every_command_the_page_invokes_is_registered() {
+        let source = include_str!("lib.rs");
+        let marker = concat!("#[tauri::", "command]");
+        let declared: Vec<&str> = source
+            .match_indices(marker)
+            .filter_map(|(at, _)| source[at..].split_once("fn ").map(|(_, rest)| rest))
+            .map(|rest| rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or(""))
+            .collect();
+
+        let page = include_str!("../../ui/shell-page.js");
+        let invoked: Vec<&str> = page
+            .match_indices("invoke('")
+            .filter_map(|(at, _)| page[at..].split_once("invoke('").map(|(_, rest)| rest))
+            .map(|rest| rest.split('\'').next().unwrap_or(""))
+            .filter(|name| !name.starts_with("plugin:"))
+            .collect();
+
+        assert!(!declared.is_empty(), "no commands were found; the scan broke, do not delete it");
+        assert!(!invoked.is_empty(), "the page invokes nothing; the scan broke, do not delete it");
+        for name in invoked {
+            assert!(
+                declared.contains(&name),
+                "the page invokes `{name}`, which is not a registered command; registered: {declared:?}"
+            );
         }
     }
 

@@ -33,6 +33,26 @@ const WORKING = new Set(['starting']);
 
 let state = { profiles: [], problems: [] };
 
+/** Failures this page raised itself, kept beside the host's problem list. */
+let clientProblems = [];
+
+/**
+ * Run one host call and surface a rejection.
+ *
+ * A command that does not exist, or one that throws, otherwise fails silently:
+ * the button looks dead and nothing anywhere says why — which is exactly how a
+ * misnamed invoke hid for a whole test round.
+ */
+async function act(work) {
+  clientProblems = [];
+  try {
+    await work();
+  } catch (error) {
+    clientProblems = [String(error)];
+  }
+  await refresh();
+}
+
 /** One launchable row. Rebuilt on every refresh, so it stays declarative. */
 function profileRow(profile) {
   const li = document.createElement('li');
@@ -93,22 +113,24 @@ function profileRow(profile) {
   start.textContent = running ? 'Restart' : 'Start';
   start.disabled = WORKING.has(profile.phase) || Boolean(profile.startNote);
   start.title = profile.startNote ?? '';
-  start.addEventListener('click', async () => {
-    if (running) await invoke('stop_profile', { profileId: profile.id });
-    await invoke('start_profile', { profileId: profile.id });
-  });
+  start.addEventListener('click', () =>
+    act(async () => {
+      if (running) await invoke('stop_profile', { profileId: profile.id });
+      await invoke('start_profile', { profileId: profile.id });
+    }),
+  );
 
   const open = document.createElement('button');
   open.type = 'button';
   open.textContent = 'Open';
   open.disabled = !ready;
-  open.addEventListener('click', () => invoke('open_harness', { profileId: profile.id }));
+  open.addEventListener('click', () => act(() => invoke('open_harness', { profileId: profile.id })));
 
   const stop = document.createElement('button');
   stop.type = 'button';
   stop.textContent = 'Stop';
   stop.disabled = !running;
-  stop.addEventListener('click', () => invoke('stop_profile', { profileId: profile.id }));
+  stop.addEventListener('click', () => act(() => invoke('stop_profile', { profileId: profile.id })));
 
   actions.append(start, open, stop);
   li.append(actions);
@@ -131,7 +153,7 @@ function render() {
   el.profiles.replaceChildren(...state.profiles.map(profileRow));
   el.empty.hidden = state.profiles.length > 0;
 
-  const problems = state.problems ?? [];
+  const problems = [...(state.problems ?? []), ...clientProblems];
   el.problems.hidden = problems.length === 0;
   el.problems.textContent = problems.join('\n');
 
@@ -242,14 +264,7 @@ async function refresh() {
   render();
 }
 
-el.reload.addEventListener('click', async () => {
-  try {
-    await invoke('reload_profiles');
-  } catch (error) {
-    state.problems = [...(state.problems ?? []), String(error)];
-  }
-  await refresh();
-});
+el.reload.addEventListener('click', () => act(() => invoke('reload_profiles')));
 
 await listen('dsh://status', (event) => {
   // Starting a profile without a configured executable is guidance, not a
