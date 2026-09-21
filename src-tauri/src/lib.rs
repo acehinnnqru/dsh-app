@@ -29,7 +29,7 @@ use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 use config::AppConfig;
 use node_probe::NodeProbeCache;
-use preset_store::ResolvedPreset;
+use preset_store::{Origin, ResolvedPreset};
 use runtime_store::RuntimeStore;
 use supervisor::{Phase, SupervisedChild};
 
@@ -106,7 +106,9 @@ impl ShellState {
         serde_json::json!({
             "id": id,
             "label": entry.preset.label.clone().unwrap_or_else(|| id.clone()),
+            "origin": entry.origin,
             "kind": entry.preset.kind,
+            "startNote": start_note(entry),
             "profile": entry.preset.profile_name(),
             "bundles": entry.preset.bundle_list(),
             "needsInternals": entry.preset.needs_internals(),
@@ -158,6 +160,28 @@ impl ShellState {
             "problems": self.problems,
         })
     }
+}
+
+/// Why one entry cannot be started, or `None` when it can.
+///
+/// A preset states the `kind` it wants, while a discovered profile only states
+/// its bundles — so the reason names what that profile lacks instead of blaming
+/// a kind the user never chose.
+fn start_note(entry: &ResolvedPreset) -> Option<String> {
+    let kind = entry.preset.kind.as_str();
+    if kind == "web" {
+        return None;
+    }
+    Some(match (entry.origin, kind) {
+        (_, "task") => format!("kind \"task\" (the {} bundle) is not implemented yet", preset::HEADLESS_BUNDLE),
+        (_, "server") => format!(
+            "kind \"server\" (the {} or {} bundle) is not implemented yet",
+            preset::ACP_BUNDLE,
+            preset::SDK_BUNDLE
+        ),
+        (Origin::Profile, _) => format!("this profile has no {} bundle, so there is no GUI to serve", preset::WEB_BUNDLE),
+        (Origin::Preset, _) => format!("kind \"{kind}\" is not implemented yet"),
+    })
 }
 
 /// Ask the configured channel whether a newer runtime exists.
@@ -758,12 +782,12 @@ fn stop_preset(
     Ok(())
 }
 
-/// Reload presets from disk, reporting any file that could not be parsed.
+/// Reload presets and profiles from disk, reporting anything unreadable.
 #[tauri::command]
 fn reload_presets(state: tauri::State<'_, Mutex<ShellState>>) -> Result<(), String> {
     let mut state = lock_state(&state)?;
     let home = state.config.home.clone();
-    let (presets, problems) = preset_store::load_all(&home, preset_seed_dir().as_deref());
+    let (presets, problems) = preset_store::load_all_with_profiles(&home, preset_seed_dir().as_deref());
     state.presets = presets;
     state.problems = problems;
     Ok(())
@@ -1165,12 +1189,8 @@ pub fn run() {
         }
     };
 
-    let (presets, preset_problems) = preset_store::load_all(&config.home, preset_seed_dir().as_deref());
+    let (presets, preset_problems) = preset_store::load_all_with_profiles(&config.home, preset_seed_dir().as_deref());
     problems.extend(preset_problems);
-    let autostart = presets.first().map(|entry| entry.preset.id.clone());
-    // A shell with nothing to launch with must not autostart: it would fail
-    // before the user has had a chance to fill in the form (spec §3.2).
-    let can_autostart = !presets.is_empty() && node_state.as_ref().is_ok_and(|state| state.node().is_some());
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1203,16 +1223,16 @@ pub fn run() {
             save_settings
         ])
         .setup(move |app| {
+            // Nothing is started here on purpose: the launcher opens on its
+            // list, and a runtime only exists once the user asks for one. The
+            // shell therefore never picks a profile on the user's behalf, and a
+            // first run with nothing configured stays a form instead of a
+            // failure (spec §3.2, design doc §21).
             let probe_handle = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(6));
                 install_page_probe(&probe_handle);
             });
-            if can_autostart {
-                if let Some(preset_id) = autostart.clone() {
-                    start_preset(app.handle().clone(), preset_id);
-                }
-            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -1246,6 +1266,76 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write one profile manifest, in the shape upstream `initProfile` writes.
+    fn write_profile(home: &Path, name: &str, bundles: &[&str], patch_reload: Option<&str>) {
+        let dir = home.join(profile::PROFILES_DIR).join(name);
+        std::fs::create_dir_all(&dir).expect("create the profile directory");
+        let mut profile = serde_json::json!({ "bundles": bundles });
+        if let Some(value) = patch_reload {
+            profile["patchReload"] = serde_json::Value::String(value.to_owned());
+        }
+        let manifest = serde_json::json!({ "dsh": { "profile": profile } });
+        std::fs::write(dir.join("package.json"), manifest.to_string()).expect("write the manifest");
+    }
+
+    /// The page renders this payload and nothing else, so its shape is the
+    /// contract: one row per launchable thing, each saying where it came from
+    /// and — when it cannot start — why (design doc §21).
+    #[test]
+    fn the_payload_lists_every_profile_and_marks_what_cannot_start() {
+        let home = std::env::temp_dir().join(format!("dsh-app-payload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create the test home");
+        // `dsh-app` is owned by the default preset the store writes, `demo` and
+        // `base` are not owned by anything.
+        write_profile(&home, "dsh-app", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
+        write_profile(&home, "demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
+        write_profile(&home, "base", &["@deepseek-ai/dsh-base"], None);
+
+        let (presets, problems) = preset_store::load_all_with_profiles(&home, None);
+        assert!(problems.is_empty(), "{problems:?}");
+        let state = ShellState {
+            config: AppConfig {
+                home: home.clone(),
+                runtime: config::RuntimeConfig { dir: home.join("runtime") },
+                settings_problems: Vec::new(),
+            },
+            presets,
+            children: BTreeMap::new(),
+            problems: Vec::new(),
+            store: RuntimeStore::new(&home),
+            node_probe: NodeProbeCache::default(),
+            expose_internals: false,
+            last_check: None,
+        };
+
+        let payload = state.snapshot();
+        let rows = payload["presets"].as_array().expect("presets is a list");
+        let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap_or_default()).collect();
+        assert_eq!(ids, ["dsh-app", "base", "demo"]);
+
+        // The declared preset comes first and starts normally.
+        assert_eq!(rows[0]["origin"], "preset");
+        assert_eq!(rows[0]["kind"], "web");
+        assert_eq!(rows[0]["startNote"], serde_json::Value::Null);
+        // A profile whose bundles carry no GUI is listed, and says why it cannot
+        // start, instead of promising a window it would never open (D3.3).
+        assert_eq!(rows[1]["origin"], "profile");
+        assert_eq!(rows[1]["kind"], "none");
+        assert!(
+            rows[1]["startNote"].as_str().unwrap_or_default().contains("no @deepseek-ai/dsh-web-app bundle"),
+            "{}",
+            rows[1]["startNote"]
+        );
+        // A discovered profile is startable and keeps its own reload mode.
+        assert_eq!(rows[2]["origin"], "profile");
+        assert_eq!(rows[2]["profile"], "demo");
+        assert_eq!(rows[2]["patchReload"], "live");
+        assert_eq!(rows[2]["startNote"], serde_json::Value::Null);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// The runtime publishes `^22.19.0 || >=24.0.0`; the check exists only to
     /// produce a warning, so it must never claim a version is fine when it is not,

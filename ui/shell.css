@@ -163,7 +163,32 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
   gap: 10px;
 }
 
-.preset-name { font-weight: 600; }
+.preset-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.preset-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Which kind of entry this is — a preset file or a discovered profile. Kept
+   quiet: it explains the list, it is not a status. */
+.tag {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.tag[data-origin="profile"] { border-style: dashed; }
 
 .badge {
   padding: 1px 8px;
@@ -180,9 +205,29 @@ h1 { font-size: 15px; font-weight: 600; margin: 0; }
 .badge[data-phase="exited"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
 
 .preset-meta {
-  margin: 6px 0 10px;
+  margin: 6px 0 4px;
   color: var(--muted);
   font-size: 11.5px;
+}
+
+/* The file or directory behind the row. Right-to-left so the ellipsis eats the
+   leading directories and the last segment stays visible. */
+.preset-source {
+  margin: 0 0 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  user-select: text;
+}
+
+.preset-note {
+  margin: 0 0 10px;
+  color: var(--warn);
+  font-size: 11.5px;
+  user-select: text;
 }
 
 .preset-actions { display: flex; gap: 8px; }

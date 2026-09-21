@@ -969,7 +969,7 @@ dsh web: http://127.0.0.1:45677    ← second（patch 固定的端口）
 
 - **自动启动的 preset 是"排序后第一个"**，不是用户上次选择或显式标记的那个。当前 `dsh-app` 因为
   字母序在前而自动启动；如果以后 seed 了更靠前的 id，行为会默默改变。应改成显式声明（preset 里加
-  `default = true`，或记住上次选择）。
+  `default = true`，或记住上次选择）。→ **已由 §21 处理：自动启动整个去掉了。**
 - **列表不热监听**：新增 preset 文件后必须点 "Reload presets"。shell 已经有 `reload_presets` 命令，
   接一个 `notify` 监听是后续小改动。
 
@@ -1379,6 +1379,59 @@ Mach-O 判定，这样新增一个原生依赖不会静默漏签（漏签的后�
    - 运行期依旧走 `runtime:probe` 与壳的种子冒烟。
 
 **首批条目**：`@deepseek-ai/libreoffice-kit-darwin-arm64`（255 MB）。它是 `@deepseek-ai/libreoffice-kit` 的 optionalDependency，由 `createConverter` 内部 `require.resolve` 惰性解析，闭包里没有第二处引用；代价只有 office→PDF 在用时报 `Required LibreOfficeKit native package is missing`。
+
+## 21. 启动器列出全部 profile（并去掉自动启动）
+
+**背景**：装进 `/Applications` 之后打开壳，列表里只有一行 `Default`。两件事凑在一起：
+
+- 壳列的是 `$DSH_HOME/dsh-app/presets/*.toml`，而 CLI 早就把 profile 建在
+  `$DSH_HOME/profiles/`（`web`、`demo`、`au-web`…），一个都不在列表里；
+- 壳启动时自动起"排序后的第一个 preset"，于是"打开壳"等于"打开一个 `dsh-app` profile 的窗口"。
+
+用户要的是反过来：**打开壳先看到全部 profile，起哪个由我自己决定**。
+
+### 21.1 发现，而不是让用户再抄一遍
+
+`profiles/<name>/package.json` 的 `dsh.profile` 段本来**就是**一份完整的启动声明：`bundles`
+决定它能以哪种载体起，`patchReload` 决定它是否需要 internals（D3.1 的映射表原样适用）。
+所以壳读它，而不是要求用户把每个 profile 再写成一个 preset：
+
+- 清单来自 profile 自己的 manifest（`profile::discover`）；
+- `kind` 由 bundles 推出：含 `@deepseek-ai/dsh-web-app` → `web`；含
+  `@deepseek-ai/dsh-headless` → `task`；含 `@deepseek-ai/dsh-acp-app` /
+  `@deepseek-ai/dsh-sdk-app` / `@deepseek-ai/dsh-sdk-minimal` → `server`；
+  只有安装层 `dsh-base` → `none`。**四种都列出来**，但只有 `web` 可启动，
+  其余的 Start 是 disabled 并写明缺哪个 bundle——这正是 D3.3 要消灭的那类
+  "起了一个永远不出 URL 的进程"；
+- 发现的 profile **不物化、不写入**：`profile::materialize` 对已有 profile 本来就是
+  no-op，而 profile 自己的 `cordis.patch.yml` 是用户层，壳不碰（§11.5 的边界继续成立）；
+- `profiles/node_modules`（全 home 的安装回退，上游同样拒绝把它当名字）与没写 manifest 的
+  目录不是 profile，跳过；写了 manifest 但**没有** `dsh.profile` 段的目录会报进 problems，
+  而不是静默消失。
+
+### 21.2 一份 profile 只有一行
+
+preset 的 `profile` 指向哪个 profile，那个 profile 就不再单独列一行：preset 是更具体的表述
+（可能带 `patches` / `env`），两行都能起同一个 profile 只是同一件事的两种说法。
+顺序固定为**先 preset（按文件路径）、后 profile（按名字）**，preset 的默认列表位置不变。
+
+### 21.3 不再自动启动
+
+`setup` 里 "起 `presets.first()`" 那段删掉了：
+
+- "排序后第一个"本来就不是语义（§13.2 记的正是这条），而"记住上次选择"会让壳在用户没看列表前
+  就拉起一个后端；
+- 没有东西在跑是壳的默认状态，用户按下 Start 才产生第一个子进程；
+- 未配置 Node 的 `slim` 壳本来就不能自动启动，去掉之后两条路径合一。
+
+### 21.4 实测
+
+| 检查项 | 结果 |
+|---|---|
+| `cargo test`（27 项，新增 9 项） | 通过：发现/跳过的边界、坏 manifest 报错、profile 去重（含 id 撞名）、排序、kind 分类、以及页面实际消费的 payload 形状 |
+| `cargo build` | 与改动前同样 9 条 warning（都是既有的 dead-code） |
+| 打包态实测（`sign-app.sh bundled` 的产物 + 一份指向真实 profile 的隔离 home） | 列表 6 行：2 个 preset（`Default`/`Second`）+ `au-web`/`demo`/`desktop`/`web`；`dsh-app` 只出现一次；6 行全部 `idle`、`url` 为空、无任何子进程（确认不再自动启动）；`problems` 为空 |
+| 签名与冒烟（同一产物） | 13 个 Mach-O + app 带 `TeamIdentifier=XQYB6GQJJ5`，`--verify --deep --strict` 通过，种子冒烟通过（node / pnpm / web 三件事都没被这次改动碰到） |
 
 ## 附录 A — Tauri v2 平台事实（已核实，2026-09-16）
 

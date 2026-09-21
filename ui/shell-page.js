@@ -38,7 +38,7 @@ const WORKING = new Set(['materializing', 'starting']);
 
 let state = { presets: [], problems: [] };
 
-/** One preset row. Rebuilt on every refresh, so it stays declarative. */
+/** One launchable row. Rebuilt on every refresh, so it stays declarative. */
 function presetRow(preset) {
   const li = document.createElement('li');
   li.className = 'preset';
@@ -46,25 +46,55 @@ function presetRow(preset) {
   const head = document.createElement('div');
   head.className = 'preset-head';
 
+  const title = document.createElement('span');
+  title.className = 'preset-title';
+
   const name = document.createElement('span');
   name.className = 'preset-name';
   name.textContent = preset.label;
+
+  // A preset is a file the user wrote; a profile is a directory the harness
+  // already had. They behave the same here, but they are not the same thing.
+  const origin = document.createElement('span');
+  origin.className = 'tag';
+  origin.dataset.origin = preset.origin;
+  origin.textContent = preset.origin;
+
+  title.append(name, origin);
 
   const badge = document.createElement('span');
   badge.className = 'badge';
   badge.dataset.phase = preset.phase;
   badge.textContent = preset.phase;
 
-  head.append(name, badge);
+  head.append(title, badge);
   li.append(head);
 
   const meta = document.createElement('p');
   meta.className = 'preset-meta';
   const bits = [`kind ${preset.kind}`, `profile ${preset.profile}`, `patchReload ${preset.patchReload}`];
+  if (preset.origin === 'profile') bits.push(`${preset.bundles.length} bundle(s)`);
   if (preset.patchFiles.length > 0) bits.push(`${preset.patchFiles.length} patch layer(s)`);
   if (preset.needsInternals) bits.push('needs internals');
   meta.textContent = bits.join(' · ');
   li.append(meta);
+
+  // Where the row comes from. The stylesheet trims it from the left, because
+  // the last segment is the part that answers "which file do I edit".
+  const source = document.createElement('p');
+  source.className = 'preset-source mono';
+  source.textContent = preset.source;
+  source.title = preset.source;
+  li.append(source);
+
+  // The host decides whether a row is startable and why not; the page only
+  // reports it, so there is exactly one definition of "this can be launched".
+  if (preset.startNote) {
+    const note = document.createElement('p');
+    note.className = 'preset-note';
+    note.textContent = preset.startNote;
+    li.append(note);
+  }
 
   const actions = document.createElement('div');
   actions.className = 'preset-actions';
@@ -75,8 +105,8 @@ function presetRow(preset) {
   const start = document.createElement('button');
   start.type = 'button';
   start.textContent = running ? 'Restart' : 'Start';
-  start.disabled = WORKING.has(preset.phase) || preset.kind !== 'web';
-  start.title = preset.kind === 'web' ? '' : `kind "${preset.kind}" is not implemented yet`;
+  start.disabled = WORKING.has(preset.phase) || Boolean(preset.startNote);
+  start.title = preset.startNote ?? '';
   start.addEventListener('click', async () => {
     if (running) await invoke('stop_preset', { presetId: preset.id });
     await invoke('start_preset_command', { presetId: preset.id });

@@ -13,7 +13,8 @@
     <main>
       <header>
         <h1>DeepSeek Harness</h1>
-        <button id="reload" type="button" class="ghost" title="Re-read preset files">Reload presets</button>
+        <button id="reload" type="button" class="ghost"
+                title="Re-read preset files and profiles">Reload list</button>
       </header>
 
       <section id="fatal" class="problems" hidden></section>
@@ -52,8 +53,9 @@
       <ul id="presets" class="presets"></ul>
 
       <p id="empty" class="empty" hidden>
-        No presets found. Add a preset file under <code>dsh-app/presets/</code> and press
-        <em>Reload presets</em>.
+        No presets and no profiles found. Add a preset file under
+        <code>dsh-app/presets/</code>, or create a profile with the <code>dsh</code> CLI,
+        then press <em>Reload list</em>.
       </p>
 
       <details class="facts-wrap">

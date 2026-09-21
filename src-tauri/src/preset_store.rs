@@ -5,14 +5,20 @@
 //! child environment — so dsh-app never invents a second configuration
 //! language. Presets live in `$HOME/dsh-app/presets/<id>.toml`.
 //!
-//! @see docs/design-tauri-wrapper.md D3
+//! The store also lists the profiles that already exist under
+//! `$HOME/profiles/`: a profile the `dsh` CLI created is a complete launch
+//! configuration on its own, so it is listed as it is instead of being restated
+//! as a preset (design doc §21).
+//!
+//! @see docs/design-tauri-wrapper.md D3, §21
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::preset::Preset;
+use crate::preset::{self, Preset};
+use crate::profile::{self, DiscoveredProfile};
 
 /// Directory holding preset files, under the shell's own home.
 pub const PRESETS_DIR: &str = "dsh-app/presets";
@@ -51,14 +57,76 @@ fn default_kind() -> String {
     "web".to_owned()
 }
 
-/// A preset plus the directory its relative paths resolve against.
+/// Where one launchable entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// A `.toml` file under `dsh-app/presets/` that the user declared.
+    Preset,
+    /// A profile directory under `profiles/` that already existed.
+    Profile,
+}
+
+/// One launchable entry plus the directory its relative paths resolve against.
 #[derive(Debug, Clone)]
 pub struct ResolvedPreset {
     pub preset: Preset,
     /// Absolute patch files, in application order.
     pub patch_files: Vec<PathBuf>,
-    /// The preset file this came from.
+    /// The preset file, or the profile directory, this came from.
     pub source: PathBuf,
+    /// Which of the two it is.
+    pub origin: Origin,
+}
+
+/// Every launchable entry: the declared presets, then the profiles they do not own.
+///
+/// A profile a preset already points at is not listed again: the preset is the
+/// more specific statement (it may add patch layers or an environment), and two
+/// rows starting the same profile would be two ways to do one thing. Rows are
+/// keyed by id — the child map and the harness window label both use it — so a
+/// profile whose name a preset already uses as its id is skipped as well.
+pub fn load_all_with_profiles(home: &Path, seed: Option<&Path>) -> (Vec<ResolvedPreset>, Vec<String>) {
+    let (mut entries, mut problems) = load_all(home, seed);
+    let (profiles, profile_problems) = profile::discover(home);
+    problems.extend(profile_problems);
+
+    // Owned, not borrowed: the entries vector grows below.
+    let claimed: BTreeSet<String> = entries
+        .iter()
+        .flat_map(|entry| [entry.preset.id.clone(), entry.preset.profile_name().to_owned()])
+        .collect();
+    for profile in profiles {
+        if claimed.contains(profile.name.as_str()) {
+            continue;
+        }
+        entries.push(from_profile(profile));
+    }
+    (entries, problems)
+}
+
+/// Wrap one discovered profile as a launchable entry.
+///
+/// Nothing is materialized and nothing is written: the profile exists, and its
+/// own manifest is the authority for its bundles and reload mode.
+fn from_profile(profile: DiscoveredProfile) -> ResolvedPreset {
+    let kind = preset::kind_for_bundles(&profile.bundles).to_owned();
+    ResolvedPreset {
+        preset: Preset {
+            id: profile.name.clone(),
+            label: Some(profile.name.clone()),
+            kind,
+            profile: Some(profile.name),
+            // Display only: this list is never written back to the profile.
+            bundles: Some(profile.bundles),
+            patch_reload: profile.patch_reload,
+            env: BTreeMap::new(),
+            node: None,
+        },
+        patch_files: Vec::new(),
+        source: profile.dir,
+        origin: Origin::Profile,
+    }
 }
 
 /// Load every preset from `<home>/dsh-app/presets/`, writing the default first.
@@ -147,6 +215,7 @@ pub fn load_one(path: &Path) -> Result<ResolvedPreset, String> {
         },
         patch_files,
         source: path.to_path_buf(),
+        origin: Origin::Preset,
     })
 }
 
@@ -224,4 +293,127 @@ fn default_preset_text() -> String {
          \n\
          [env]\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A throwaway harness home, removed when the test ends.
+    struct TempHome(PathBuf);
+
+    impl TempHome {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("dsh-app-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create the test home");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Write one preset file.
+        fn preset(&self, id: &str, profile: &str) {
+            let dir = self.0.join(PRESETS_DIR);
+            fs::create_dir_all(&dir).expect("create the preset directory");
+            let text = format!("id = \"{id}\"\nlabel = \"{id}\"\nprofile = \"{profile}\"\n");
+            fs::write(dir.join(format!("{id}.toml")), text).expect("write the preset");
+        }
+
+        /// Write one profile manifest, in the shape upstream `initProfile` writes.
+        fn profile(&self, name: &str, bundles: &[&str], patch_reload: Option<&str>) {
+            let dir = self.0.join(crate::profile::PROFILES_DIR).join(name);
+            fs::create_dir_all(&dir).expect("create the profile directory");
+            let mut profile = serde_json::json!({ "bundles": bundles });
+            if let Some(value) = patch_reload {
+                profile["patchReload"] = serde_json::Value::String(value.to_owned());
+            }
+            let manifest = serde_json::json!({ "dsh": { "profile": profile } });
+            fs::write(dir.join("package.json"), manifest.to_string()).expect("write the manifest");
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The store writes a default preset on first run, and that preset claims
+    /// the `dsh-app` profile: one profile must not become two rows.
+    #[test]
+    fn a_declared_preset_owns_its_profile() {
+        let home = TempHome::new("store-dedup");
+        home.profile("dsh-app", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], None);
+        home.profile("demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
+
+        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
+            ["dsh-app", "demo"]
+        );
+        assert_eq!(entries[0].origin, Origin::Preset);
+        assert_eq!(entries[1].origin, Origin::Profile);
+    }
+
+    #[test]
+    fn a_discovered_profile_keeps_its_own_declaration() {
+        let home = TempHome::new("store-declaration");
+        home.profile("demo", &["@deepseek-ai/dsh-base", preset::WEB_BUNDLE], Some("live"));
+
+        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        let demo = entries
+            .iter()
+            .find(|entry| entry.preset.id == "demo")
+            .expect("demo is listed");
+        assert_eq!(demo.preset.kind, "web");
+        assert_eq!(demo.preset.label.as_deref(), Some("demo"));
+        assert_eq!(demo.preset.profile_name(), "demo");
+        assert_eq!(demo.source, home.path().join(crate::profile::PROFILES_DIR).join("demo"));
+        // A discovered profile adds no patch layer: its own `cordis.patch.yml`
+        // is the user's layer, and the harness is what applies it.
+        assert!(demo.patch_files.is_empty());
+        // `live` is the profile's own statement, so internals capability is required.
+        assert!(demo.preset.needs_internals());
+        assert!(demo.preset.env.is_empty());
+        assert!(demo.preset.node.is_none());
+    }
+
+    /// Rows are keyed by id: a preset that merely *borrows* the name must not
+    /// leave two rows fighting over the same child and window label.
+    #[test]
+    fn a_profile_whose_name_is_already_a_preset_id_is_skipped() {
+        let home = TempHome::new("store-id-clash");
+        home.preset("demo", "somewhere-else");
+        home.profile("demo", &[preset::WEB_BUNDLE], None);
+        home.profile("other", &[preset::WEB_BUNDLE], None);
+
+        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
+            ["demo", "dsh-app", "other"]
+        );
+    }
+
+    #[test]
+    fn presets_come_first_and_profiles_follow_in_name_order() {
+        let home = TempHome::new("store-order");
+        home.preset("zulu", "zulu");
+        home.preset("alpha", "alpha");
+        home.profile("gamma", &[preset::WEB_BUNDLE], None);
+        home.profile("delta", &[preset::WEB_BUNDLE], None);
+
+        let (entries, problems) = load_all_with_profiles(home.path(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            entries.iter().map(|entry| entry.preset.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "dsh-app", "zulu", "delta", "gamma"]
+        );
+    }
 }
