@@ -22,7 +22,7 @@
 | 缩成一个右上角的设置按钮 | after the guide the form lives in a gear-triggered sheet | §6 |
 | 不要系统 titlebar，红绿灯和标题栏都自定义 | the title bar is gone (borderless overlay); the **lights are the system's**, floating over the page's own header strip | §2.1, §2.2 |
 | 想要有玻璃质感 | a real `NSVisualEffectView` under the shell window's transparent content area; panels carry alpha | §2.4, §7 |
-| dsh 主渲染窗口也不要原生标题栏，也要半透明毛玻璃 | **reversed during review** — the dsh window is a standard macOS window (system title bar, system lights, system dragging) and nothing is written into its page | §2.5 |
+| dsh 主渲染窗口也不要原生标题栏，也要半透明毛玻璃 | the same borderless treatment, through the marker the runtime documents for its own desktop app: native lights in the band it reserves, translucent sidebar, no title bar | §2.5 |
 | 设计语言要和 dsh 统一 | the shell's palette *is* the runtime's: the `--dsw-*` token sheets are mirrored verbatim | §7 |
 | 列表平铺两行，用亮/不亮/红色表示状态 | flat two-line rows, one light per row, no cards and no state words | §5 |
 | 进去是分步的，两步走，等于引导页 | step 1 = runtime, step 2 = profile; the launcher comes after | §3 |
@@ -50,19 +50,21 @@
    puts a real `NSVisualEffectView` behind a transparent webview; the page's surfaces carry
    alpha instead of opaque fills, and every colour in it is one of the runtime's `--dsw-*`
    tokens (§7), so the two windows read as one product.
-6. **And the shell writes nothing into the dsh page.** X1, restored to its strictest form: no
-   injected script, no `eval`, no stylesheet, no marker attribute, no overlay. The dsh window
-   is an ordinary window on the runtime's URL, and a test pins those absences (§2.5).
+6. **The dsh window is borderless too, through the runtime's own door.** Its page gets host
+   chrome and nothing else: the `data-platform="darwin"` marker the runtime documents for its
+   desktop app — which is what reserves the band the native lights sit in and turns its sidebar
+   translucent — plus a drag listener for that band. No stylesheet, no token override, no drawn
+   chrome, and a test bounds the whole footprint (§2.5).
 
 ---
 
 ## 2. The windows
 
-Both windows are standard macOS windows: the system draws the title bar and the traffic
-lights, AppKit owns dragging, zooming and resizing, and nothing in either window is drawn by
-us except the page content. An earlier draft replaced that chrome with page-drawn lights and
-a hidden title bar; the decision recorded here is the opposite — native chrome, content below
-it. What survives from that draft is the glass, and only where the page is ours to paint.
+Both windows are **borderless with the system's own traffic lights**: no title bar strip
+anywhere, the page runs to the top edge, and the three native buttons float over it. AppKit
+still owns the corners, the shadow, dragging (through a drag region each window provides) and
+resizing, and neither window draws a control of its own — the lights are the system's, which is
+the fourth and final answer this document records to "whose chrome is it".
 
 ### 2.1 Configuration
 
@@ -106,9 +108,10 @@ it. What survives from that draft is the glass, and only where the page is ours 
 
 ### 2.2 The page, below the title bar
 
-The window has no visible title bar, so the page's own 40 px header row is the top of the
-window: the three native lights float over its left end, the mark and the name sit beside them,
-and the current view's icon actions are on the right. Everything below it is content.
+The window has no title bar at all, so the page's own 40 px header row is the top of the window:
+the three native lights float over its left end, the mark and the name sit beside them, and the
+current view's icon actions are on the right. The strip paints nothing — no fill, no separator —
+so nothing in the window reads as chrome.
 
 ```
 ● ● ●  › DEEPSEEK HARNESS                ⟳      ⚙   ← .page-head, and the drag region
@@ -152,42 +155,43 @@ The blur is AppKit's, not CSS. Tauri's `windowEffects` ends in
 Material: `sidebar`. If the glass has to go (Q3), it is one config block plus one token
 block; no component changes.
 
-### 2.5 The dsh window: a standard window, and nothing written into its page
+### 2.5 The dsh window: borderless too, through the runtime's own door
 
-`harness:<profile>` is an ordinary Tauri window on the runtime's loopback URL: system title
-bar, system traffic lights, system dragging, the runtime's own UI below it, 1280×860 by
-default. The shell sets the title, the size, the centre position and the navigation guard, and
-that is the whole of it.
+The dsh window is borderless in the same way as the shell window — `titleBarStyle: "Overlay"` +
+`hiddenTitle`, `transparent: true`, the same `windowEffects` — and the runtime's traffic
+lights float over its page. What makes that work is a single attribute the runtime documents
+for exactly this case:
 
-**X1 — the shell writes nothing into the runtime's page.** No injected script, no `eval`, no
-stylesheet, no custom property, no marker attribute, no overlay. A test pins those absences
-(`the_harness_window_writes_nothing_into_its_page`), because it is the property a later change
-would be most tempted to break.
+**X1 — the shell writes host chrome and nothing else.** Into the runtime's page it puts:
 
-Two earlier drafts did the opposite, and both are withdrawn:
+1. `document.documentElement.dataset.platform = 'darwin'`, the marker the runtime's own
+   preload sets in its desktop app ("set only by the desktop preload", read at render time).
+   Under it the runtime renders its macOS layout: **a 52 px band that clears the traffic
+   lights**, a translucent sidebar over our window's material, and a transparent frame.
+   Without it, the native lights would sit on top of the sidebar's own brand row.
+2. a drag listener. The band is *documented* as the window's drag region, but it does that
+   with `-webkit-app-region: drag` — an Electron/Chromium extension that WKWebView does not
+   implement, so in our shell the band is inert and the host has to move the window itself.
+   The rule is a screen region (the top 52 px, or anywhere with ⌘ held) plus "not on an
+   interactive element"; it never inspects the runtime's markup.
 
-- drawing our own lights in the runtime's title band and emulating Electron's
-  `-webkit-app-region: drag` inside its page;
-- switching on the runtime's own macOS layout by setting `data-platform="darwin"` in it — a
-  real integration point, but one that exists to serve a hidden title bar and a translucent
-  window, and this design has neither.
+It draws nothing, restyles nothing, reads no DOM. The capability it needs is one file,
+`capabilities/harness.json`: `windows: ["harness:*"]`, the loopback origins as `remote.urls`,
+and exactly two permissions — `core:window:allow-start-dragging` and
+`core:window:allow-toggle-maximize`. **No application command is reachable from that page**:
+the runtime's origin is *remote* to Tauri (`plugin_command.is_some() || has_app_acl_manifest ||
+!is_local`), so `save_settings`, `start_profile` and the rest stay closed to it, and the host
+script is pinned by a test to calling plugin commands only.
 
-Two facts from those drafts are worth keeping, because they make the withdrawal a matter of
-fact rather than taste:
+**What this does not do.** It does not restyle the runtime: no stylesheet, no token override,
+no drawn chrome. The sidebar becomes translucent because that is the runtime's own darwin
+design, switched on by its own marker; the centre column stays opaque because that is also its
+design. If the harness should look different, that is a dsh theme plugin's job, not this
+launcher's.
 
-- `-webkit-app-region` is an Electron/Chromium extension. WKWebView does not implement it, so
-  any band the runtime marks as a drag region is inert here. With a system title bar that stops
-  mattering: AppKit's own title bar drags.
-- The runtime's page is a *remote* origin to Tauri (`http://127.0.0.1:port`), so custom
-  commands are refused there — the check is
-  `plugin_command.is_some() || has_app_acl_manifest || !is_local`. Reaching them would mean
-  opening this app's commands to remote content. Nothing of ours runs in that page now, the
-  `harness` capability file is deleted, and the dsh window is granted no permission at all.
-
-The transparency the earlier draft wanted there is gone with it: an opaque page over a glass
-window shows nothing, so the dsh window is not transparent. Its appearance belongs to its
-authors; if the harness itself should be translucent, that is a dsh theme plugin's job, not
-this launcher's.
+**Two earlier drafts**, page-drawn lights and a plain window with a visible title bar, are both
+withdrawn — the first because the system's lights were wanted, the second because a visible
+title bar is what this section exists to remove.
 
 ### 2.6 Rejected
 
@@ -196,7 +200,8 @@ this launcher's.
 | Page-drawn traffic lights (`decorations: false`) | the window loses `Titled`, so AppKit stops rounding it, stops drawing its shadow and stops offering title-bar dragging — and the system's own lights were wanted in the end |
 | A visible title bar (`titleBarStyle: "Visible"`) | it costs a strip of chrome the page does not need and makes the launcher look like a different application from the dsh window beside it |
 | Hiding the standard buttons and revealing them on hover | not a window behaviour macOS offers; it takes AppKit calls and page-side pointer tracking to look *less* native |
-| Vibrancy on the dsh window | an opaque page cannot show it, so a transparent window there buys nothing |
+| A visible title bar on the dsh window | it is what this design removes; with the marker set, the runtime reserves the band its own lights need, so there is nothing left to put a strip behind |
+| Restyling the runtime's page (stylesheets, token overrides, drawn chrome) | X1: its appearance is its authors'; the marker is the one integration point it documents, and it is enough |
 | `data-platform="darwin"` in the runtime's page | a real integration point, but it exists to serve a hidden title bar and a translucent window, both of which this design dropped |
 | `movableByWindowBackground` as a drag substitute | every mouse-down over a page becomes a candidate window drag, which breaks selection and dragging inside the dsh UI |
 | Resizing the window per view | a jumping window is worse than one size that scrolls |
@@ -549,9 +554,10 @@ These are the "optimize the logic" half of the request; none of them is cosmetic
 9. **The single-instance handler shows the window** before focusing it, so a second
    launch during the hidden-start window is not a no-op.
 10. **The harness window is created by the shell, not by the config file.** It lives in a
-    `harness_window` module that owns the title, the size and the navigation guard — and
-    nothing else, because there is nothing else to own: no injected script, no vibrancy, no
-    chrome. A test asserts those absences rather than trusting them (§11).
+    `harness_window` module that owns its chrome (titlebar style, material, the one host
+    script), its navigation guard, and its label. That script is the only place in this crate
+    that writes into a page it does not own, so a test bounds it (§11): the marker, the drag
+    listener, no DOM drawing, and plugin commands only.
 11. **App commands check who is calling.** The ACL does not gate app commands, so
     `save_settings`, `finish_onboarding` and `dismiss_problems` take
     `window: tauri::Window` and refuse anything but `shell`. The dsh page cannot reach them
@@ -570,10 +576,12 @@ These are the "optimize the logic" half of the request; none of them is cosmetic
 | `src-tauri/tauri.conf.json` | window chrome + size, `visible: false`, `withGlobalTauri: false`, `macOSPrivateApi` |
 | `src-tauri/Cargo.toml` | `macos-private-api` feature |
 | `src-tauri/capabilities/shell.json` | `+ core:window:allow-start-dragging`, because the page's header strip is the drag region of a window whose title bar is invisible |
+| `src-tauri/capabilities/harness.json` | **new** — `windows: ["harness:*"]`, the loopback origins, and two window controls. No application command is reachable from that page |
 | `src-tauri/src/settings.rs` | `onboarded` + `profile`; load-modify-write `save`; `save_onboarding`; tests |
 | `src-tauri/src/config.rs` | `homeSource`; no change to `resolve_dsh` |
 | `src-tauri/src/lib.rs` | payload additions; `shell_ready`, `finish_onboarding`, `dismiss_problems`; home re-resolution; watchdog; blank-dsh rule; caller checks; tests |
-| `src-tauri/src/harness_window.rs` | **new** — harness window creation: title, size, navigation guard. No injection, no vibrancy, no chrome |
+| `src-tauri/src/harness_window.rs` | **new** — harness window creation: borderless chrome, vibrancy, navigation guard, the single `initialization_script` |
+| `ui/harness-host.js` | **new** — the host script injected into the runtime's page: the darwin marker and window dragging. X1's entire footprint |
 | `src-tauri/build.rs` | hash every file under `ui/` |
 | `ui/index.html` | page skeleton: header row with the mark and the icon actions, view host, banner, sheet |
 | `ui/shell.css` | token set + components (rewritten) |
@@ -604,8 +612,10 @@ New/updated tests:
 - `save_settings` re-resolves the home and re-discovers profiles from it;
 - `finish_onboarding` sets the flag and clamps an unknown profile;
 - the IPC scan covers every `ui/*.js`, and the page's `invoke` names all exist;
-- `harness_window.rs` writes nothing into its page: no `initialization_script`, no `eval`,
-  no `transparent(`, no `effects(` (`the_harness_window_writes_nothing_into_its_page`).
+- `harness_window.rs` injects exactly one script and never evals; that script sets the
+  documented marker, drags the window, and does nothing else — no `document.body`, no
+  `getComputedStyle`, no `styleSheets`, no `createElement("style")`, no `.append(`, no
+  `innerHTML`, and plugin commands only (`the_harness_window_writes_only_host_chrome`).
 
 Scripted GUI checks (the shell has no terminal — §13.6 of the governing spec — so every
 view has to be reachable from a script):
@@ -628,11 +638,12 @@ XDG_CONFIG_HOME=$cfg DSH_APP_DEBUG_STATE=1 DSH_APP_SELFTEST=web ./target/debug/d
 #    expect: page-probe {"view":"launcher", "selftest":"invoked", "phase":"ready", …}
 ```
 
-The harness window's check is the *absence* of change, and it is a source scan rather than a
-runtime probe: there is no injection to probe, and the shell may not run its own commands in
-that page anyway (it is a remote origin). One test asserts that `harness_window.rs` contains
-no `initialization_script`, no `eval`, no `transparent(` and no `effects(`; the module's whole
-job is the title, the size and the navigation guard.
+The harness window's check is a *bounded footprint*, and it is a source scan rather than a
+runtime probe: the page is a remote origin, so the shell may not run its own commands in it.
+One test asserts the shape of the whole footprint — one script, no `eval`, the marker present,
+the drag listener present, and none of the calls that would mean drawing or reading the
+runtime's UI. If a later change needs one of those, the test is where the argument has to
+happen.
 
 The end-to-end check that remains is the one that matters: with a real dsh and an isolated
 home, `DSH_APP_DEBUG_STATE=1 DSH_APP_SELFTEST=web` reaches `phase: ready` and prints
@@ -650,9 +661,10 @@ Manual checklist (macOS, both schemes):
   edge, min size holds; the lights hover, dim when unfocused, and close/minimize/zoom;
 - glass: move the shell window over a light and a dark background — the blur follows the
   window, panels stay readable, and window focus dims the material and the lights together;
-- harness window: a standard macOS window — visible system title bar, system lights (hover
-  shows the system's glyphs), native drag by the title bar, zoom, edge resizing; the runtime's
-  UI below it looks exactly as it does in a browser;
+- harness window: no title bar; the system's lights float in the band the runtime reserves for
+  them, clear of its sidebar's own brand row; the sidebar is translucent over the material and
+  the centre column stays opaque; dragging works from that band and from ⌘-drag anywhere;
+  double-click zooms; native corners, shadow and edge resizing all survive;
 - palette: the two windows side by side read as one product — same neutrals, same hairlines,
   same monochrome primary button, same state colours;
 - launch: the window does not flash white, and it still appears if the page is broken
@@ -672,10 +684,11 @@ Manual checklist (macOS, both schemes):
 - No runtime, no install, no update, no probing, no candidate path table (governing spec §7).
 - No auto-start of anything the user did not click: the launcher never boots a profile on
   its own, and the guide starts one only from the button that names it.
-- **X1: nothing is written into the runtime's page.** No injected script, no `eval`, no
-  stylesheet, no custom property, no marker attribute, no overlay — and no capability: the dsh
-  window is granted no permission at all. If the harness itself should be translucent or
-  differently styled, that is a dsh theme plugin's job, not this launcher's.
+- **X1: host chrome, never a UI patch.** Into the runtime's page the shell writes exactly two
+  things: the `data-platform` marker the runtime documents for a macOS host, and a drag
+  listener for the band that marker reserves — plus two window controls in its capability. Its
+  DOM, stylesheets and tokens are untouched; if the harness itself should look different, that
+  is a dsh theme plugin's job, not this launcher's.
 - No private palette: the shell's colours and radii are the runtime's `--dsw-*` tokens (§7),
   mirrored rather than invented.
 - No new dependency (the dialog plugin is deliberately not used — see Q4).
@@ -694,11 +707,11 @@ Manual checklist (macOS, both schemes):
 | Q4 | A native file picker (`tauri-plugin-dialog`)? | **Not now.** Paste + drag-and-drop cover it with no new dependency; the crate is in the local cargo cache, so it stays a cheap follow-up if pasting annoys people. The Nix build runs `cargo build --release --offline`, so a new crate also means a lockfile update that has to resolve offline. |
 | Q5 | Persist the chosen profile and pin it in the launcher? | **Yes** — it is one optional field, and it makes the second launch feel like it remembered. |
 
-Q6 (the chrome of both windows) took three passes during review. What is implemented is the
-third: **the shell window is borderless with the system's native lights floating over its own
-header strip**, and the dsh window is an ordinary window with a visible title bar. The
-page-drawn lights and the plain visible title bar both exist only in this document's history —
-§2.1, §2.2 and §2.6 say what each alternative cost.
+Q6 (the chrome of both windows) took four passes during review. What is implemented is the
+last: **both windows are borderless**, both keep the system's native lights, and the dsh window
+gets there through the marker the runtime documents for its own desktop app. Page-drawn lights,
+a visible title bar on the shell, and a visible title bar on the dsh window all exist only in
+this document's history — §2, §2.5 and §2.6 say what each alternative cost.
 
 Q1–Q5 stand as recommended. Q1 and Q4 are the only ones whose answer would ripple if it changed,
 and both are cheap to change before the code that depends on them lands.

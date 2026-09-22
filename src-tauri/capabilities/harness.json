@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "harness",
+  "description": "The dsh GUI window renders the runtime's page from its own loopback origin, which Tauri treats as a remote origin: without a capability naming that origin, even a window control is refused there. The window has no title bar, so its host script has to move it - these two controls are the whole grant, and no application command is reachable from that page.",
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "windows": ["harness:*"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize"
+  ]
+}

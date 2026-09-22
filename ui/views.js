@@ -249,10 +249,11 @@ function profileRow(profile, options = {}) {
     title: radio ? null : profile.phase,
   });
 
+  // No carrier tag: when every profile is the same kind the tag is noise, and a
+  // profile that cannot be launched says why on its second line anyway.
   const body = [
     leading,
     el('span', { class: 'name', text: profile.label }),
-    el('span', { class: 'kind', text: profile.kind }),
     profile.startNote
       ? el('span', { class: 'why', text: profile.startNote })
       : el('span', { class: 'path', text: shortPath(profile.source, home), title: profile.source }),

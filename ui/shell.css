@@ -172,42 +172,29 @@ body {
 
 /* ------------------------------------------------------------- page header */
 
-/* The window is borderless: AppKit still draws the traffic lights, floating over
- * this strip, so the strip reserves their width and is the drag region. The
- * `data-tauri-drag-region` attribute is handled by the window plugin's injected
- * script, which is what `core:window:allow-start-dragging` is for. */
+/* There is no title bar to mimic: AppKit draws the traffic lights straight onto
+ * the page, so this strip is invisible — no fill, no separator, no wordmark — and
+ * does two jobs: it stays out of the lights' way (78 px on the left is exactly
+ * their reserve), and it is the drag region (the `data-tauri-drag-region`
+ * attribute, which `core:window:allow-start-dragging` pays for).
+ *
+ * Everything below it is on one grid: 20 px from either edge. The strip's own
+ * right padding is that same 20 px, so the icons line up with the list beneath
+ * them instead of floating somewhere near it. */
 .page-head {
   flex: none;
   height: var(--page-head);
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 0 8px 0 78px;
-  background: color-mix(in srgb, var(--dsw-alias-bg-module-platform) 88%, transparent);
-  border-bottom: 1px solid var(--line);
+  padding: 0 20px 0 78px;
 }
 
 .page-head .spacer { flex: 1; }
 
-.brand { display: flex; align-items: center; gap: 8px; }
-
-.mark {
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  background: var(--dsw-alias-brand-primary);
-  color: var(--dsw-static-neutral-bluish-00);
-  font: 600 11px/1 var(--dsw-font-family);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.brand-name { font-size: 13px; font-weight: 600; color: var(--fg); }
-
 .icon {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -230,7 +217,7 @@ body {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 24px 28px 28px;
+  padding: 8px 20px 24px;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -328,12 +315,12 @@ button:disabled { opacity: .42; cursor: default; }
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  padding: 4px 22px 6px;
+  padding: 4px 20px 6px;
   color: var(--muted);
   font-size: 12px;
 }
 
-.rows { list-style: none; margin: 0; padding: 6px 10px 10px; display: flex; flex-direction: column; gap: 2px; }
+.rows { list-style: none; margin: 0; padding: 6px 20px 10px; display: flex; flex-direction: column; gap: 2px; }
 
 .row { position: relative; border-radius: 10px; }
 .row:hover { background: var(--hover); }
@@ -342,10 +329,10 @@ button:disabled { opacity: .42; cursor: default; }
 .row-hit {
   width: 100%;
   display: grid;
-  grid-template-columns: 16px 1fr auto;
+  grid-template-columns: 16px 1fr;
   align-items: center;
   gap: 3px 10px;
-  padding: 8px 10px 9px;
+  padding: 8px 0 9px;
   background: none;
   border: 0;
   border-radius: 0;
@@ -408,12 +395,11 @@ div.row-hit { cursor: default; }
 }
 
 .why { direction: ltr; color: var(--warn); }
-.kind { color: var(--faint); font-size: 11px; }
 
 .row-actions {
   position: absolute;
   top: 8px;
-  right: 10px;
+  right: 0;
   display: flex;
   gap: 6px;
   opacity: 0;
@@ -423,7 +409,7 @@ div.row-hit { cursor: default; }
 .row:hover .row-actions, .row:focus-within .row-actions { opacity: 1; }
 .row-actions button { height: 24px; padding: 0 10px; font-size: 12px; }
 
-.row details { padding: 0 10px 10px; }
+.row details { padding: 0 0 10px; }
 .row summary { color: var(--muted); cursor: pointer; font-size: 12px; }
 .row pre {
   max-height: 160px;

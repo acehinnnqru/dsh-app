@@ -1251,27 +1251,58 @@ mod tests {
         }
     }
 
-    /// The harness window writes nothing into the runtime's page.
+    /// X1: the harness window's page gets host chrome and nothing else.
     ///
-    /// This is the invariant the design rests on: the dsh GUI is a standard macOS
-    /// window — system title bar, system traffic lights, system dragging — and the
-    /// page inside it belongs to its authors. An `initialization_script` or an
-    /// `eval` here would quietly turn the shell back into something that patches
-    /// someone else's UI, so both are pinned absent (docs/spec-shell-ux.md §2.5).
+    /// The window is borderless, so the shell writes exactly two things into a page
+    /// it does not own: the marker attribute the runtime documents for a macOS
+    /// host, and a listener that drags the window from the band that marker
+    /// reserves. It may not draw, restyle or read the runtime's UI, and it may only
+    /// call plugin commands — this app's own commands are unreachable from a remote
+    /// origin (docs/spec-shell-ux.md §2.5).
     #[test]
-    fn the_harness_window_writes_nothing_into_its_page() {
+    fn the_harness_window_writes_only_host_chrome() {
         let source = include_str!("harness_window.rs");
-        assert!(
-            !source.contains("initialization_script"),
-            "the harness window must not inject a script"
+        assert_eq!(
+            source.matches("initialization_script").count(),
+            1,
+            "the harness window injects one script, not several"
         );
+        assert!(source.contains("include_str!(\"../../ui/harness-host.js\")"));
+        assert!(!source.contains(".eval("), "no eval: the page is written to once");
+
+        let host = include_str!("../../ui/harness-host.js");
         assert!(
-            !source.contains(".eval("),
-            "the harness window must not evaluate in its page"
+            host.contains("dataset.platform = 'darwin'"),
+            "the script must set the marker the runtime documents"
         );
-        assert!(
-            !source.contains("transparent(") && !source.contains("effects("),
-            "the harness window has no host chrome to make translucent"
-        );
+        for forbidden in [
+            "document.body",
+            "getComputedStyle",
+            "styleSheets",
+            "insertRule",
+            "createElement('style')",
+            "querySelector(",
+            ".append(",
+            "innerHTML",
+        ] {
+            assert!(
+                !host.contains(forbidden),
+                "the host script must not use `{forbidden}`; see docs/spec-shell-ux.md §2.5"
+            );
+        }
+        // Every window command goes through the plugin, never through this app:
+        // the runtime's page is a remote origin and the app's commands are closed
+        // to it by construction.
+        assert!(host.contains("invoke(`plugin:window|${command}`"));
+        for (at, _) in host.match_indices("invoke('") {
+            let name = host[at..]
+                .split_once("invoke('")
+                .and_then(|(_, rest)| rest.split('\'').next())
+                .unwrap_or("");
+            assert!(
+                name.starts_with("plugin:"),
+                "the host script invokes `{name}`, which is not a plugin command"
+            );
+        }
     }
 }
